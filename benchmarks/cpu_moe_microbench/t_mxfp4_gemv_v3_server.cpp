@@ -213,12 +213,12 @@ int main() {
             std::memcpy((char*)m + offP, packed.data(), szP);
             std::memcpy((char*)m + offS, scales.data(), szS);
             std::memset((char*)m + offS + szS, 0, szO);
-            // Convert act: int32 -> float (shader t_mxfp4_gemv_fa reads StructuredBuffer<float> act)
+            // Bit-cast act: int32 (same bit pattern as float32) -> float (memcpy, NOT (float)int)
             {
                 float* aDst = (float*)((char*)m + offA);
                 int32_t* aSrc = (int32_t*)act.data();
                 UINT32 nAct = szA / 4;
-                for (UINT32 i = 0; i < nAct; i++) aDst[i] = (float)aSrc[i];
+                for (UINT32 i = 0; i < nAct; i++) std::memcpy(&aDst[i], &aSrc[i], 4);
             }
             std::memcpy((char*)m + offB, bias.data(), szB);
             { float* g = (float*)((char*)m + offG); for (UINT32 i = 0; i < M; i++) g[i] = 1.0f;
