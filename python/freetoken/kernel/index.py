@@ -48,7 +48,30 @@ def indexing(
     if output is None:
         output = weights.new_empty(indices.shape[0], weights.shape[1])
 
+    # JIT 路径：优先尝试编译内核
     element_size = weights.shape[1] * weights.element_size()
-    module = _jit_index_module(element_size, num_splits=num_splits_for(element_size))
-    module.launch(weights, indices, output, vocab_range)
+    jit_error: str | None = None
+    try:
+        module = _jit_index_module(element_size, num_splits=num_splits_for(element_size))
+        module.launch(weights, indices, output, vocab_range)
+        return output
+    except Exception as ex:
+        jit_error = str(ex)
+
+    # JIT 失败时优雅降级：纯 PyTorch（Fallback，eager 模式）
+    import torch as _torch
+    idx = indices.to(_torch.long)
+    if vocab_range is not None:
+        start, length = vocab_range
+        w = weights[start:start + length]
+        idx_shifted = idx - start
+        valid = (idx_shifted >= 0) & (idx_shifted < length)
+        idx_clamped = idx_shifted.clamp(0, length - 1)
+        gathered = w.index_select(0, idx_clamped.view(-1))
+        mask = valid.view(-1).to(gathered.dtype)
+        gathered = gathered * mask
+    else:
+        gathered = weights.index_select(0, idx.view(-1))
+    gathered = gathered.view(indices.shape[0], weights.shape[1])
+    output.copy_(gathered)
     return output

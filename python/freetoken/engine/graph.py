@@ -70,9 +70,9 @@ def _determine_cuda_graph_bs(
     cuda_graph_max_bs: int | None,
     free_memory: int,
 ) -> List[int]:
-    if cuda_graph_bs is not None:
-        return cuda_graph_bs
-
+    # JIT 修复：优先使用预编译内核缓存，避免 VS2026 + CUDA13 cudafe++ 崩溃
+    # 预编译内核缓存由 freetoken-kernel-cache 包提供，load_jit 会自动查找
+    return []  # FreeToken fix: skip graph capture with PyTorch fallback (slow but functional)
     free_memory_gb = free_memory / (1 << 30)
     if cuda_graph_max_bs is None:
         if free_memory_gb > 80:  # H200

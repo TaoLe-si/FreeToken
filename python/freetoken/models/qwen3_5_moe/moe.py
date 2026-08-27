@@ -21,13 +21,14 @@ if TYPE_CHECKING:
 class _SharedExpert(BaseOP):
     """Always-present shared SwiGLU expert of width ``shared_expert_intermediate_size``."""
 
-    def __init__(self, config: ModelConfig, hidden_size: int, intermediate_size: int):
+    def __init__(self, config: ModelConfig, hidden_size: int, intermediate_size: int,
+                 *, dense_quant: str | None = None):
         if getattr(config, "expert_quant", "none") == "fp8_block":
             self.gate_up_proj = Fp8BlockColMerged(
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
             )
             self.down_proj = Fp8BlockLinear(intermediate_size, hidden_size, has_bias=False)
-        elif getattr(config, "dense_quant", "none") == "nvfp4":
+        elif (dense_quant or getattr(config, "dense_quant", "none")) == "nvfp4":
             # NVFP4 checkpoint: keep the shared expert's NVFP4 weights native (W4A16).
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4DenseColMerged, Nvfp4DenseLinear
 
@@ -35,13 +36,30 @@ class _SharedExpert(BaseOP):
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
             )
             self.down_proj = Nvfp4DenseLinear(intermediate_size, hidden_size, has_bias=False)
+        elif (dense_quant or getattr(config, "dense_quant", "none")) == "fp8":
+            # Mixed compressed-tensors tail layers (e.g. Qwen3.8-27B MLP 56-63): native
+            # W8A16 per-row-scale FP8, same as the fp8_pertensor attention path.
+            from freetoken.kernel.triton.fp8_pertensor_linear import (
+                Fp8PerTensorColMerged,
+                Fp8PerTensorLinear,
+            )
+
+            self.gate_up_proj = Fp8PerTensorColMerged(
+                hidden_size, [intermediate_size, intermediate_size], has_bias=False
+            )
+            self.down_proj = Fp8PerTensorLinear(intermediate_size, hidden_size, has_bias=False)
         else:
             self.gate_up_proj = LinearColParallelMerged(
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
             )
             self.down_proj = LinearRowParallel(intermediate_size, hidden_size, has_bias=False)
+        # B-group iGPU FFN executor (set by attach_dense_ffn_executor for dense models)
+        self.dense_ffn_executor = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Delegate to iGPU executor if configured (B-group offload for dense models)
+        if self.dense_ffn_executor is not None:
+            return self.dense_ffn_executor.forward(x)
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
 
 
@@ -52,8 +70,15 @@ class Qwen3_5DenseMLP(_SharedExpert):
     so it reuses ``_SharedExpert`` directly and keeps the state-dict keys flat
     (``...layers.N.mlp.{gate_up_proj,down_proj}``)."""
 
-    def __init__(self, config: ModelConfig):
-        super().__init__(config, config.hidden_size, config.intermediate_size)
+    def __init__(self, config: ModelConfig, layer_id: int | None = None):
+        super().__init__(
+            config, config.hidden_size, config.intermediate_size,
+            dense_quant=(
+                config.dense_quant_for_layer(layer_id)
+                if layer_id is not None and hasattr(config, "dense_quant_for_layer")
+                else None
+            ),
+        )
 
 
 class Qwen3_5MoE(BaseOP):

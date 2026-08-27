@@ -36,16 +36,40 @@ def causal_conv1d_varlen(
             x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state
         )
 
-    from sgl_kernel import causal_conv1d_fwd
+    # Defensive device alignment: with --kv-device cpu the FLAMetadata index
+    # tensors are host-side; every kernel below (sgl or triton) needs them on
+    # the compute device next to x/weight/states.
+    dev = x.device
+    def _dev(t, dt=None):
+        # Host sequences (lists/tuples -- e.g. FLAMetadata.has_initial_state built
+        # on CPU for --kv-device cpu) are Triton pointer errors waiting to happen.
+        if not isinstance(t, torch.Tensor):
+            try:
+                return torch.tensor(t, dtype=dt, device=dev)
+            except Exception:
+                return t
+        return t.to(dev, non_blocking=True) if t.device != dev else t
+    weight = _dev(weight); conv_states = _dev(conv_states)
+    cu_seqlens = _dev(cu_seqlens, torch.int32)
+    cache_indices = _dev(cache_indices, torch.int32)
+    has_initial_state = _dev(has_initial_state, torch.bool)
 
-    if x.stride(-1) != 1:
-        x = x.contiguous()
-    causal_conv1d_fwd(
-        x, weight, None, conv_states,
-        cu_seqlens.to(torch.int32), cache_indices.to(torch.int32),
-        has_initial_state, True, _PAD_SLOT_ID,
+    if is_sgl_kernel_installed():
+        from sgl_kernel import causal_conv1d_fwd
+        if x.stride(-1) != 1:
+            x = x.contiguous()
+        causal_conv1d_fwd(
+            x, weight, None, conv_states,
+            cu_seqlens.to(torch.int32), cache_indices.to(torch.int32),
+            has_initial_state, True, _PAD_SLOT_ID,
+        )
+        return x
+    from freetoken.kernel.triton.causal_conv1d_triton import (
+        causal_conv1d_varlen as triton_causal_conv1d_varlen,
     )
-    return x
+    return triton_causal_conv1d_varlen(
+        x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state
+    )
 
 
 def causal_conv1d_decode(
@@ -56,17 +80,25 @@ def causal_conv1d_decode(
 ) -> torch.Tensor:
     """Single-token (decode) causal conv update with silu; shifts+appends the new
     token into ``conv_state[conv_state_indices]`` in place and returns silu(conv)."""
+    dev = x.device
+    def _dev2(t, dt=None):
+        if not isinstance(t, torch.Tensor):
+            try:
+                return torch.tensor(t, dtype=dt, device=dev)
+            except Exception:
+                return t
+        return t.to(dev, non_blocking=True) if t.device != dev else t
+    conv_state = _dev2(conv_state); weight = _dev2(weight)
+    conv_state_indices = _dev2(conv_state_indices, torch.int32)
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
     if not is_sgl_kernel_installed():
         from freetoken.kernel.triton.causal_conv1d_triton import (
             causal_conv1d_decode as triton_causal_conv1d_decode,
         )
-
         return triton_causal_conv1d_decode(x, conv_state, weight, conv_state_indices)
 
     from sgl_kernel import causal_conv1d_update
-
     x = x.unsqueeze(-1)
     causal_conv1d_update(
         x, conv_state, weight, None, True, None,

@@ -120,13 +120,18 @@ struct IndexKernel {
         .with_dtype(weights_dtype_)
         .with_device<kDLCUDA>(device_)
         .verify(output);
-    TensorMatcher({L}) //
-        .with_dtype<int32_t, int64_t>(indices_dtype_)
-        .with_device<kDLCUDA>(device_)
-        .verify(indices);
+    /* MSVC 下该链式重载决议有误：改为等价手工校验 */
+    RuntimeCheck(indices.dim() == 1,
+                 "IndexKernel: indices must be 1-D.");
+    RuntimeCheck(indices.size(0) == L.unwrap(),
+                 "IndexKernel: indices length mismatch.");
+    RuntimeCheck(indices.device().device_type == kDLCUDA,
+                 "IndexKernel: indices must be CUDA tensor.");
+    RuntimeCheck(indices.dtype().bits == 32 || indices.dtype().bits == 64,
+                 "IndexKernel: indices dtype must be int32/int64.");
 
     const auto device = device_.unwrap();
-    const auto use_int32 = indices_dtype_.unwrap().bits == 32;
+    const auto use_int32 = indices.dtype().bits == 32;
     const auto num_indices = L.unwrap();
     const auto entry_size = dtype_bytes(weights_dtype_.unwrap()) * D.unwrap();
     RuntimeCheck(entry_size == element_size,

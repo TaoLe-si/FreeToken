@@ -337,6 +337,12 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                logger.info_rank0(
+                    "[dbg-reply] phase=%s tok=%d eos=%s can_decode=%s out_len=%d",
+                    "prefill" if batch.is_prefill else "decode",
+                    next_token, next_token in self.eos_token_ids,
+                    req.can_decode, len(req.output_ids) if hasattr(req,"output_ids") else -1,
+                )
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 hit_length = not req.can_decode
@@ -415,6 +421,8 @@ class Scheduler(SchedulerIOMixin):
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
         )
+        if reply:
+            logger.info_rank0("[dbg-reply] sending %d msgs", len(reply))
         self.send_result(reply)
 
     def _match_stop_str(self, req: Req) -> str | None:

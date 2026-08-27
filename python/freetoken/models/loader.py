@@ -151,10 +151,8 @@ CT_SCALE_SUFFIXES = (
 class ShardReader:
     """Serves tensors by name across safetensors shards (handles opened lazily).
 
-    The quant scales of a ``weight_packed`` can land in a DIFFERENT shard than the
-    packed weight itself (Muse-Glimmer-30B-NVFP4 splits layer 49's down_proj across
-    the shard boundary), so sibling lookups must go through the index's weight_map
-    rather than the shard the packed weight came from."""
+    Uses direct file I/O instead of safetensors.torch.safe_open to avoid Windows mmap
+    crashes with large (20+ GB) safetensors files on PyTorch 2.11+."""
 
     def __init__(self, model_path: str, device: torch.device):
         folder = download_hf_weight(model_path)
@@ -165,16 +163,56 @@ class ShardReader:
             self._map = {
                 name: os.path.join(folder, shard) for name, shard in weight_map.items()
             }
-        else:  # single-file checkpoint
-            import safetensors
-
+        else:  # single-file checkpoint: read header without safe_open
             self._map = {}
             for file in iter_weight_files(model_path):
-                with safetensors.safe_open(file, framework="pt", device="cpu") as f:
-                    for name in f.keys():
+                with open(file, "rb") as fp:
+                    # Read 8-byte little-endian header size
+                    import struct
+                    header_size = struct.unpack("<Q", fp.read(8))[0]
+                    fp.seek(8)
+                    json_header = fp.read(header_size)
+                import json as _json
+                header = _json.loads(json_header)
+                for name in header:
+                    if name != "__metadata__":
                         self._map[name] = file
         self._device = str(device)
-        self._handles: dict[str, object] = {}
+        # _headers caches the parsed safetensors header per file (name → metadata dict)
+        self._headers: dict[str, dict] = {}
+        # _files: open file handles for reading (path → file object)
+        self._files: dict[str, object] = {}
+        # dtype mapping from safetensors format names to torch dtypes
+        self._DTYPE_MAP = {
+            "F32": torch.float32,
+            "F16": torch.float16,
+            "BF16": torch.bfloat16,
+            "U8": torch.uint8,
+            "I8": torch.int8,
+            "I32": torch.int32,
+            "I64": torch.int64,
+            "BOOL": torch.bool,
+            "F8_E4M3": torch.float8_e4m3fn,
+            "F8_E5M2": torch.float8_e5m2,
+        }
+
+    def _ensure_header(self, file: str) -> dict:
+        """Lazily read and cache the safetensors header for a file."""
+        if file not in self._headers:
+            with open(file, "rb") as fp:
+                import struct
+                header_size = struct.unpack("<Q", fp.read(8))[0]
+                fp.seek(8)
+                json_header = fp.read(header_size)
+            import json as _json
+            self._headers[file] = _json.loads(json_header)
+        return self._headers[file]
+
+    def _ensure_file(self, file: str) -> object:
+        """Lazily open and cache the file handle for a shard."""
+        if file not in self._files:
+            self._files[file] = open(file, "rb")
+        return self._files[file]
 
     def files(self) -> list[str]:
         return sorted(set(self._map.values()))
@@ -183,22 +221,37 @@ class ShardReader:
         return [name for name, shard in self._map.items() if shard == file]
 
     def get_tensor(self, name: str) -> torch.Tensor:
-        import safetensors
+        import struct
 
         file = self._map[name]
-        h = self._handles.get(file)
-        if h is None:
-            h = safetensors.safe_open(file, framework="pt", device=self._device).__enter__()
-            self._handles[file] = h
-        return h.get_tensor(name)
+        header = self._ensure_header(file)
+        meta = header[name]
+        off0, off1 = meta["data_offsets"]
+        shape = list(meta["shape"])
+        dtype_str = meta["dtype"]
+        dtype = self._DTYPE_MAP.get(dtype_str, torch.float32)
+
+        fp = self._ensure_file(file)
+        fp.seek(0)  # Reset to beginning of file
+        header_size = struct.unpack("<Q", fp.read(8))[0]
+        # NOTE: torch.frombuffer creates CPU tensors. This is intentional --
+        # the engine's _weight_row_major.clone() happens during load_state_dict
+        # and a CUDA clone would OOM on 8 GB dGPU with 22+ GB checkpoint loaded.
+        fp.seek(8 + header_size + off0)
+        raw = fp.read(off1 - off0)
+        t = torch.frombuffer(bytearray(raw), dtype=dtype)
+        t = t.reshape(shape)
+        return t
 
     def close(self) -> None:
-        for h in self._handles.values():
+        for fp in self._files.values():
             try:
-                h.__exit__(None, None, None)
-            except Exception:  # noqa: BLE001 -- best-effort handle cleanup
+                fp.close()
+            except Exception:  # noqa: BLE001
                 pass
-        self._handles.clear()
+        self._files.clear()
+        self._headers.clear()
+
 
 
 def nvfp4_parts_ct(f, raw_base: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

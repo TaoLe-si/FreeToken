@@ -261,13 +261,20 @@ class FTWReader:
                 if entry is None:
                     fd = os.open(os.path.join(self.dir, file), os.O_RDONLY)
                     try:
-                        m = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+                        if hasattr(mmap, "PROT_READ"):
+                            m = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+                        else:
+                            # Windows: no prot flags; ACCESS_READ maps copy-on-write-free
+                            # read-only pages. fileno must be dup'd because mmap closes
+                            # its handle only on close() -- os.close here is still safe
+                            # since the mapping object owns the view, not the fd.
+                            m = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
                     finally:
                         os.close(fd)  # the mapping keeps its own reference to the file
                     try:
                         m.madvise(mmap.MADV_SEQUENTIAL)  # kernel readahead for streaming
                     except (AttributeError, OSError):
-                        pass
+                        pass  # Windows has no madvise
                     entry = (m, memoryview(m))
                     self._maps[file] = entry
         return entry[1]

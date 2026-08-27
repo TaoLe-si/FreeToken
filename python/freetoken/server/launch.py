@@ -51,20 +51,42 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     if detach:
         _detach_process_group()
     from freetoken.tokenizer import tokenize_worker
-
-    tokenize_worker(**kwargs)
+    try:
+        tokenize_worker(**kwargs)
+    except BaseException as exc:
+        # 黑匣子：worker 静默死亡时把遗言写到本地日志并上报 ack，供守护进程/桌面呈现。
+        try:
+            import os as _os, traceback as _tb, datetime as _dt
+            base = _os.path.join(_os.environ.get("LOCALAPPDATA", ""), "freeToken", "daemon", "logs")
+            _os.makedirs(base, exist_ok=True)
+            with open(_os.path.join(base, "worker-detokenizer.log"), "a", encoding="utf-8") as f:
+                f.write(_dt.datetime.now().strftime("[%m-%d %H:%M:%S] ") + repr(exc) + "\n" + _tb.format_exc() + "\n")
+        except Exception:
+            pass
+        try:
+            _report_startup_error(kwargs.get("ack_queue"), exc)
+        except Exception:
+            pass
+        raise
 
 
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
+    import asyncio as _a, sys as _s
+    if _s.platform == "win32":
+        _a.set_event_loop_policy(_a.WindowsSelectorEventLoopPolicy())
+    import os as _osd
+    if _osd.environ.get("FT_STACK_DUMP") == "1":
+        import faulthandler as _fh
+        try:
+            _fh.dump_traceback_later(12, repeat=True)
+        except Exception:
+            pass
     if args.shell_mode:
         _detach_process_group()
 
-    # published (not bound) here: the engine binds it after the allocator setup
-    from freetoken.gpu_select import set_assigned_gpu
-
-    # resolved UUIDs when we have them, the raw --gpu entries when NVML could not resolve them, else one CUDA ordinal per rank
-    targets = args.gpu_assigned or args.gpu or tuple(str(r) for r in range(args.tp_info.size))
-    set_assigned_gpu(targets[args.tp_info.rank])
+    # Weight-loader policy switches (read via env inside models/*/weight.py).
+    if getattr(args, "ct_fp8", "native") == "bf16":
+        _osd.environ["FREETOKEN_CT_FP8"] = "bf16"
 
     import torch
     from freetoken.scheduler import Scheduler
@@ -97,10 +119,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             try:
                 from freetoken.kvcache.cache_status import compute_cache_status_meta
 
-                meta = compute_cache_status_meta(scheduler.engine)
-                # the parent must not touch CUDA to learn this
-                meta["gpus"] = scheduler.gpus
-                ack_queue.put(("meta", meta))
+                ack_queue.put(("meta", compute_cache_status_meta(scheduler.engine)))
             except Exception:  # noqa: BLE001 -- metadata is a nicety; readiness is not
                 pass
             ack_queue.put("Scheduler is ready")
@@ -137,18 +156,15 @@ def launch_server(
     )
     logger = init_logger(__name__, "initializer")
 
-    if server_args.gpu:
-        # resolve here so a typo is one clear error before any worker spawns
-        from freetoken.gpu_select import resolve_gpu_uuids
-
+    # [ft-zmq-env-sync] Allocate every ZMQ channel HERE, in the parent process, so the
+    # spawned workers inherit the exact addresses via environment instead of re-probing
+    # (a worker's probe would see the frontend's real binding as "occupied" and dodge it).
+    for _zp in ("zmq_backend_addr", "zmq_detokenizer_addr",
+                "zmq_frontend_addr", "zmq_tokenizer_addr"):
         try:
-            server_args = replace(server_args, gpu_assigned=resolve_gpu_uuids(server_args.gpu))
-        except ValueError as exc:
-            raise SystemExit(f"{prog or 'ft serve'}: error: {exc}") from exc
-        logger.info(
-            f"--gpu {','.join(server_args.gpu)} -> "
-            f"{', '.join(server_args.gpu_assigned) if server_args.gpu_assigned else 'resolved at CUDA init (no NVML)'}"
-        )
+            getattr(server_args, _zp)
+        except Exception:
+            pass
 
     def start_subprocess() -> "BackendHandle":
         import multiprocessing as mp

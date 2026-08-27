@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import re
 import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
@@ -72,6 +74,51 @@ def detect_compressed_tensors_nvfp4(hf_config: Any) -> bool:
             "NVFP4 (group_size=16, strategy=tensor_group) only"
         )
     return saw_nvfp4
+
+
+def detect_compressed_tensors_fp8_groups(hf_config: Any) -> tuple[bool, frozenset]:
+    """Scan a compressed-tensors config_groups map for FP8 (num_bits=8 float) groups.
+
+    Returns (attn_fp8, fp8_mlp_layers): whether any FP8 group targets the attention /
+    GatedDeltaNet projections, and the explicit set of decoder-layer ids whose dense MLP
+    is FP8 (Qwen3.8-27B-NVFP4 exports keep layers 56-63 at W8A16 while 0-55 stay NVFP4).
+    Regex targets like re:.*layers\\.(56|57|...)\\.mlp\\.(gate|up|down)_proj$ are parsed
+    for their numeric alternation; targets without a per-layer list are ignored here --
+    the uniform case is carried by attn_quant/dense_quant directly."""
+    quant = getattr(hf_config, "quantization_config", None)
+    if quant is None:
+        return False, frozenset()
+    get = quant.get if isinstance(quant, dict) else (lambda k, d=None: getattr(quant, k, d))
+    if str(get("quant_method") or "").lower() != "compressed-tensors":
+        return False, frozenset()
+    groups = get("config_groups") or {}
+    attn_fp8 = False
+    mlp_layers: set[int] = set()
+    for g in (groups.values() if isinstance(groups, dict) else []):
+        w = (g or {}).get("weights") or {}
+        try:
+            bits = int(w.get("num_bits", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if bits != 8 or str(w.get("type", "")).lower() != "float":
+            continue
+        for t in ((g or {}).get("targets") or []):
+            if not isinstance(t, str) or not t.startswith("re:"):
+                continue
+            pat = t[3:]
+            if re.search("self_attn|linear_attn", pat):
+                attn_fp8 = True
+            if "mlp" in pat:
+                # compressed-tensors targets are regex source: "\." is a two-char literal
+                # (backslash + dot) -- escape sequences, not single dots. Slice between the
+                # first "(" after "layers" and the matching ")" to read the alternation list.
+                li = pat.find("layers")
+                if li >= 0:
+                    lp = pat.find("(", li + 6)
+                    rp = pat.find(")", lp + 1) if lp >= 0 else -1
+                    if 0 < lp < rp:
+                        mlp_layers.update(int(x) for x in pat[lp + 1 : rp].split("|") if x.isdigit())
+    return attn_fp8, frozenset(mlp_layers)
 
 
 @dataclass(frozen=True)
@@ -243,6 +290,10 @@ class ModelConfig:
     # it bf16. Separate from dense_quant because only some NVFP4 checkpoints quantize lm_head
     # (modelopt MIXED_PRECISION does; pure NVFP4 leaves it bf16).
     lm_head_quant: str = "none"
+    # Per-layer dense-MLP quant override for mixed compressed-tensors checkpoints
+    # (e.g. Qwen3.8-27B-NVFP4: MLP layers 56-63 are FP8 while the rest are NVFP4-packed).
+    # (layer_id, quant) pairs; absent ids fall back to dense_quant.
+    layer_dense_quant_map: Tuple[Tuple[int, str], ...] = ()
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False
     # ----- DeepSeek/GLM-style MoE extensions (default keeps other models intact) -----
@@ -366,6 +417,12 @@ class ModelConfig:
     def is_swa_layer(self, layer_id: int) -> bool:
         return isinstance(self.attention_group_for_layer(layer_id), SWAAttentionGroupConfig)
 
+    def dense_quant_for_layer(self, layer_id: int) -> str:
+        """Dense-MLP weight format for one decoder layer (mixed ct checkpoints)."""
+        for lid, q in self.layer_dense_quant_map:
+            if lid == layer_id:
+                return q
+        return self.dense_quant
     def is_linear_layer(self, layer_id: int) -> bool:
         return isinstance(
             self.attention_group_for_layer(layer_id),

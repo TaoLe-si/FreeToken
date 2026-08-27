@@ -19,9 +19,55 @@ from __future__ import annotations
 
 import os
 import signal
+
+# Windows compat: SIGKILL is not available on Windows; SIGTERM == TerminateProcess
+try:
+    _SIGKILL = signal.SIGKILL
+except AttributeError:
+    _SIGKILL = signal.SIGTERM
+
 import subprocess
 import sys
 import threading
+
+def _evt(msg: str) -> None:
+    """Append lifecycle events to %LOCALAPPDATA%\\freeToken\\daemon-events.log."""
+    import datetime as _dt
+    try:
+        base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "freeToken")
+        os.makedirs(base, exist_ok=True)
+        with open(os.path.join(base, "daemon-events.log"), "a", encoding="utf-8") as f:
+            f.write(_dt.datetime.now().strftime("[%m-%d %H:%M:%S] ") + msg + "\n")
+    except Exception:
+        pass
+
+def _serve_log_hint(port: int) -> str:
+    """Last error-ish line of this serve's log, for fast-fail classification."""
+    try:
+        p = os.path.join(os.environ.get("LOCALAPPDATA", ""), "freeToken",
+                         "daemon", "logs", ("serve-%d.log" % port) if port else "serve.log")
+        import glob as _g
+        if not os.path.isfile(p):
+            cands = _g.glob(os.path.join(os.path.dirname(p), "serve-*.log"))
+            if not cands: return "no-log"
+            p = max(cands, key=os.path.getmtime)
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            tail = f.read()[-4000:]
+        for key in ("ZMQError: Permission denied", "cache budget too small",
+                    "CUDA out of memory", "AssertionError"):
+            if key in tail: return key
+        return "early-exit"
+    except Exception:
+        return "no-log"
+
+def _win_tree_kill(pid: int) -> None:
+    """Windows: taskkill /T reaches multiprocessing spawn children (scheduler),
+    which plain TerminateProcess on the parent would orphan holding VRAM."""
+    try:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -123,26 +169,119 @@ def build_serve_command(
     """The serve invocation + its log path. ``python -m freetoken.cli serve`` (NOT ``-m
     freetoken``, which is a direct-server entrypoint that ignores subcommand argv) so it uses the
     daemon's own interpreter/venv with no PATH dependency."""
-    argv = [python, "-m", "freetoken.cli", "serve", "--model", model, "--port", str(port), *args]
+    shim = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine_zmq_shim.py")
+    argv = [python, shim, "serve", "--model", model, "--port", str(port), *args]
     log_path = os.path.join(log_dir, f"serve-{port}.log")
     return argv, log_path
 
 
-def spawn_serve(argv: list[str], log_path: str) -> PopenChild:
+def spawn_serve(
+    argv: list[str],
+    log_path: str,
+    env_extra: dict[str, str] | None = None,
+) -> PopenChild:
     """Spawn the serve as a session leader with its stdout+stderr going to a real logfile fd (never
     a PIPE): the file survives daemon death, so a re-adopting daemon just resumes tailing it and
     the serve never writes to a dead pipe. ``start_new_session`` makes it a process
-    group leader so signals reach the whole worker tree via the group."""
+    group leader so signals reach the whole worker tree via the group.
+
+    ``env_extra`` carries per-start hints (e.g. ``_FT_SPILL_NEXT``) from the manager's
+    in-memory state into the child environment. Module-level code cannot read
+    ``self._spill_next`` on the manager, so the manager has to ferry it across
+    this boundary explicitly.
+    """
     os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    logf = open(log_path, "wb", buffering=0)  # truncate: a fresh serve gets a fresh log
+    # Rotate instead of truncate: a crashed attempt's traceback survives the
+    # watchdog's instant respawn as serve-<port>.log.prev.
     try:
+        if os.path.isfile(log_path):
+            os.replace(log_path, log_path + ".prev")
+    except OSError:
+        pass
+    logf = open(log_path, "wb", buffering=0)  # fresh serve gets a fresh log
+    try:
+        # Engine resolution: default to the DAEMON's own interpreter resolution
+        # (keep PYTHONPATH). On dev machines that is the dev tree -- the panel's
+        # new flags (--dense-ffn-engine etc.) simply do not exist in the older
+        # installed wheel and argparse dies before writing a single log line.
+        # Opt OUT of the dev tree explicitly with FREETOKEN_SERVE_USE_WHEEL=1.
+        child_env = dict(os.environ)
+        if os.environ.get("FREETOKEN_SERVE_USE_WHEEL") == "1":
+            child_env.pop("PYTHONPATH", None)
+            for _pk in ("PYTHONHOME", "PYTHONSTARTUP", "PYTHONEXECUTABLE"):
+                child_env.pop(_pk, None)
+        # worker 崩溃时 traceback 必须落盘（非 tty 默认块缓冲会吞掉遗言）
+        child_env["PYTHONUNBUFFERED"] = "1"
+        # tokenizer 加载不得联网：模型已在本地缓存，联网校验一旦抖动
+        # detokenizer 就会 exit(1)（transformers list_repo_templates）。
+        child_env["HF_HUB_OFFLINE"] = "1"
+        child_env["TRANSFORMERS_OFFLINE"] = "1"
+        # Dense models JIT-compile small kernels (e.g. embedding index) at first
+        # load. nvcc 12.6 vs torch cu130 trips the strict version gate — the
+        # engine ships an explicit override switch for exactly this case.
+        child_env.setdefault("FREETOKEN_ALLOW_CUDA_MISMATCH", "1")
+        # Pin VS2026 to the CUDA-13-compatible MSVC 14.44 toolset and give JIT
+        # link steps direct access to cudart.lib
+        child_env.setdefault("VCToolsVersion", "14.44.35207")
+        child_env.setdefault("CUDA_PATH", "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6")  # 修: 本机工具链是 v12.6, v13.0 在本机不存在
+        child_env["LIB"] = (child_env.get("LIB", "") + ";" + child_env["CUDA_PATH"] + "\\lib\\x64").lstrip(";")
+        # Make sure nvcc can find cl.exe and the CUDA runtime DLLs even when the
+        # daemon was launched from a shell without the VS/CUDA environment.
+        try:
+            import glob as _glob
+            _extra = []
+            for _pat in (
+                r"C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64",
+                r"C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64",
+                r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin",
+                r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"  # 修: v12.6 是本机唯一可用 nvcc,
+            ):
+                for _d in sorted(_glob.glob(_pat), reverse=True):
+                    _extra.append(_d)
+            if _extra:
+                child_env["PATH"] = os.pathsep.join(_extra) + os.pathsep + child_env.get("PATH", "")
+                print("[serve] JIT toolchain PATH prepended: " + ", ".join(_extra[:3]), file=sys.stderr)
+        except Exception:
+            pass
+        # 引擎与守护同源：让 serve 子进程优先 import 打包/仓库内的开发树 freetoken
+        try:
+            import freetoken as _ftpkg
+            _installed_root = os.path.dirname(os.path.dirname(os.path.abspath(_ftpkg.__file__)))
+            # 修：原版直接把 site-packages 当作 src_root，导致开发树所有修改都被绕过。
+            # 真实意图是「dev tree 优先」：检查 E:\FreeToken\python 与 C:\FreeToken\python 是否存在，
+            # 存在则用它作为 PYTHONPATH 第一位（stdlib 之前），让 import 命中开发树。
+            _dev_root = None
+            for _cand in (r"E:\FreeToken\python", r"C:\FreeToken\python",
+                          os.path.join(os.path.dirname(_installed_root), "freetoken-dev"),
+                          os.path.join(os.path.dirname(_installed_root), "..", "..", "python")):
+                if os.path.isdir(_cand) and os.path.isfile(os.path.join(_cand, "freetoken", "__init__.py")):
+                    _dev_root = os.path.normpath(_cand)
+                    break
+            if _dev_root:
+                child_env["PYTHONPATH"] = _dev_root + os.pathsep + child_env.get("PYTHONPATH", "")
+                print("[serve] engine dev tree: " + _dev_root, file=sys.stderr)
+            else:
+                child_env["PYTHONPATH"] = _installed_root + os.pathsep + child_env.get("PYTHONPATH", "")
+                print("[serve] engine installed: " + _installed_root, file=sys.stderr)
+        except Exception:
+            pass
+        # Merge per-start hints from the manager. env_extra is the only legal channel
+        # between the manager's instance state and this module-level spawn function;
+        # reading instance attributes here would NameError. _FT_SPILL_NEXT is the canonical
+        # example: set by _start when dense weights overflow VRAM but fit in shared memory.
+        if env_extra:
+            for _k, _v in env_extra.items():
+                child_env[_k] = _v
+        CREATE_NO_WINDOW = 0x08000000
         proc = subprocess.Popen(
             argv,
+            env=child_env,
             stdout=logf,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
+            creationflags=CREATE_NO_WINDOW,
         )
     finally:
         logf.close()  # the child holds its own dup; the parent must not keep this fd
@@ -232,11 +371,11 @@ class ServeManager:
 
     # ---- default factories (overridable for tests) ----
 
-    def _default_spawn(self, model: str, port: int, args: list[str]):
+    def _default_spawn(self, model: str, port: int, args: list[str], env_extra: dict[str, str] | None = None):
         argv, log_path = build_serve_command(
             model, port, args, python=self._python, log_dir=self._log_dir
         )
-        return spawn_serve(argv, log_path)
+        return spawn_serve(argv, log_path, env_extra=env_extra)
 
     def _default_adopt(self, state):
         if not osproc.is_ft_serve_on_port(state.pid, state.port, starttime=state.starttime):
@@ -297,9 +436,154 @@ class ServeManager:
                 self._starting = True
                 break
 
+        if os.name == "nt":
+            # Windows 驱动异步回收显存：刚停过就先等显存池回稳，避免新引擎
+            # 测到缩小后的 free VRAM 把 cache budget 算成负数而 assert 自杀。
+            try:
+                self._wait_vram_settle()
+            except Exception:
+                pass
+
         child = None
         try:
-            child = self._spawn_fn(model, port, args)
+            _evt("start begin model=%s port=%s args=%s" % (model, port, args))
+            # 能力预检：稠密模型权重超过显存且引擎无稠密卸载路径 → 人话拒绝
+            if model and os.path.isdir(model):
+                try:
+                    _w = sum(os.path.getsize(os.path.join(model, f))
+                             for f in os.listdir(model)
+                             if f.endswith((".safetensors", ".gguf")))
+                    _cfg = {}
+                    _cp = os.path.join(model, "config.json")
+                    if os.path.isfile(_cp):
+                        import json as _j2
+                        _cfg = _j2.load(open(_cp, encoding="utf-8"))
+                    _is_moe = bool(_cfg.get("num_experts") or _cfg.get("num_routed_experts")
+                                   or (_cfg.get("architectures") and any("MoE" in str(a) for a in _cfg["architectures"])))
+                    if not _is_moe and not model.lower().endswith(".gguf"):
+                        def _dram_bytes():
+                            try:
+                                import ctypes as _ct2
+                                class _MSE(_ct2.Structure):
+                                    _fields_ = [("l", _ct2.c_ulong), ("load", _ct2.c_ulong), ("total", _ct2.c_ulonglong), ("avail", _ct2.c_ulonglong), ("pf", _ct2.c_ulonglong), ("apf", _ct2.c_ulonglong), ("tv", _ct2.c_ulonglong), ("av", _ct2.c_ulonglong), ("ev", _ct2.c_ulonglong)]
+                                _m = _MSE(); _m.l = _ct2.sizeof(_MSE)
+                                if _ct2.windll.kernel32.GlobalMemoryStatusEx(_ct2.byref(_m)):
+                                    return int(_m.total)
+                            except Exception:
+                                pass
+                            return 0
+                        def _vram_bytes():
+                            # 首选注册表（无 CUDA 副作用、必成功），torch 兜底
+                            try:
+                                import winreg as _wr
+                                _k = _wr.OpenKey(_wr.HKEY_LOCAL_MACHINE,
+                                    r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000")
+                                return int(_wr.QueryValueEx(_k, "HardwareInformation.qwMemorySize")[0])
+                            except Exception:
+                                pass
+                            try:
+                                import subprocess as _sp
+                                py_exe = os.environ.get("_FT_SERVE_PYTHON") or sys.executable
+                                out = _sp.check_output(
+                                    [py_exe, "-c",
+                                     "import torch; f,t = torch.cuda.mem_get_info(0); print(int(t))"],
+                                    timeout=30, stderr=_sp.DEVNULL)
+                                return int(str(out).strip().split()[-1])
+                            except Exception:
+                                return 0
+                        _vb = _vram_bytes()
+                        _db = _dram_bytes()
+                        # 预算制：直驻显存 → 全速；超显存但 ≤ 显存+0.35×内存 → 驱动共享内存回退（原生，稍慢）
+                        if _vb and _w <= int(_vb * 0.92):
+                            pass
+                        elif _vb and _db and _w <= int(_vb * 0.92 + _db * 0.35):
+                            self._spill_next = True
+                            _evt("dense oversized: 启用原生共享内存回退（权重 %.1f GB > 显存 %.1f GB，预算内）"
+                                 % (_w / 1073741824, _vb / 1073741824))
+                        elif _vb:
+                            # --dense-ffn-engine igpu 时 FFN B 组卸载到 iGPU，不受此预算限制
+                            if args and any(a.startswith("--dense-ffn-engine") and "igpu" in a for a in args):
+                                _evt("dense oversized with igpu offload: 跳过显存预算检查（权重 %.1f GB > 显存 %.1f GB）"
+                                     % (_w / 1073741824, _vb / 1073741824))
+                            else:
+                                raise RuntimeError(
+                                    "该稠密模型权重约 %.1f GB，超出本机可承载上限（显存 %.1f GB ＋ 共享回退预算 ≈ %.1f GB）。"
+                                    "可选：① Q4/NVFP4 量化档；② MoE 版本（专家卸载到内存）。"
+                                    % (_w / 1073741824, _vb / 1073741824, (_vb * 0.92 + _db * 0.35) / 1073741824))
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
+
+            # 分片完整性预检：半截模型(.incomplete/.part)只会让 worker 报
+            # KeyError 的天书，这里提前拦截并给出人话。
+            if model and not model.startswith("Qwen/") and os.path.isdir(model):
+                try:
+                    _bad = [f for f in os.listdir(model)
+                            if f.endswith((".incomplete", ".part", ".tmp"))]
+                    if _bad:
+                        _msg = ("模型分片未下载完整（%d 个未完成文件：%s…）。"
+                                "请在模型库重新下载该模型以续传补全。" % (len(_bad), _bad[0]))
+                        _evt("start aborted: " + _msg)
+                        raise RuntimeError(_msg)
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
+            # 端口卫生：上一代(含 RECOVER 链)遗留的 serve/worker 进程会占住
+            # 确定性 zmq 端口，令新一代连接超时。持锁期间清场是安全的。
+            try:
+                import subprocess as _sp
+                _sp.run(["powershell", "-NoProfile", "-Command",
+                    "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                    "Where-Object { \$_.CommandLine -match 'freetoken\\.cli serve|multiprocessing\\.spawn' } | "
+                    "ForEach-Object { Stop-Process -Id \$(\$_.ProcessId) -Force }"],
+                    capture_output=True, timeout=15)
+                self._sleep(0.6)
+            except Exception:
+                pass
+            # 把实例属性 spill_next 通过 env 传给模块级 spawn_serve（见 spawn_serve 注释）
+            if getattr(self, "_spill_next", False):
+                child_env_extra = {"_FT_SPILL_NEXT": "1"}
+            else:
+                child_env_extra = {}
+            # spawn_fn is a factory; inject env_extra so per-start hints (e.g. _FT_SPILL_NEXT)
+            # reach the child. The spawn_fn signature is (model, port, args, env_extra=...) —
+            # module-level spawn_serve and the default _default_spawn both accept it.
+            child = self._spawn_fn(model, port, args, child_env_extra)
+            # Windows 排除端口段会让调度器 ZMQ 绑定随机端口失败(Permission denied)。
+            # 8 秒内速死的子进程按日志特征重试换端口，最多 3 次。
+            import socket as _sock
+            for _attempt in range(3):
+                dead = False
+                settled = False
+                for _ in range(16):
+                    if child.poll() is not None:
+                        dead = True
+                        break
+                    try:
+                        with _sock.create_connection(("127.0.0.1", int(port)), timeout=0.25):
+                            settled = True
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(0.5)
+                if settled:
+                    _evt("spawn settled early pid=%s" % child.pid)
+                    break
+                if not dead:
+                    break
+                _ei = child.poll()
+                _evt("start FAST-FAIL pid=%s exit=%s hint=%s attempt=%d/3 model=%s"
+                     % (child.pid, getattr(_ei, "code", None), _serve_log_hint(port),
+                        _attempt + 1, model))
+                try:
+                    child.wait(timeout=2)
+                except Exception:
+                    pass
+                if _attempt == 2:
+                    break
+                child = self._spawn_fn(model, port, args)
         finally:
             if child is None:
                 with self._cond:
@@ -318,6 +602,7 @@ class ServeManager:
             self._starting = False
             self._cond.notify_all()
 
+        _evt("started ok pid=%s model=%s" % (child.pid, model))
         self._persist(child, model, port, args)
         self._maybe_apply_oom(child.pid)
         self._begin_watch(child)
@@ -384,9 +669,16 @@ class ServeManager:
         # monitor's waitpid holds Popen's internal lock.
         try:
             if not child.reaped.is_set():
-                self._signal(child.pid, signal.SIGTERM)
+                # 树杀：同时带走 multiprocessing 调度子进程，防止显存孤儿
+                if os.name == "nt":
+                    _win_tree_kill(child.pid)
+                else:
+                    self._signal(child.pid, signal.SIGTERM)
                 if not child.reaped.wait(timeout=grace):
-                    self._signal(child.pid, signal.SIGKILL)
+                    if os.name == "nt":
+                        _win_tree_kill(child.pid)
+                    else:
+                        self._signal(child.pid, _SIGKILL)
                     if not child.reaped.wait(timeout=self._reap_wait_s):
                         raise RuntimeError(
                             f"serve pid={child.pid} did not exit after SIGKILL"
@@ -399,7 +691,30 @@ class ServeManager:
                     self._stopping = False
                 self._cond.notify_all()
             raise
+        if os.name == "nt":
+            # PID 复用缓冲：taskkill 枚举与执行存在间隙，紧随其后的新代 worker
+            # 可能出生在旧清单的枪口上。冷却 1.5s 再允许下一代 spawn。
+            self._post_kill_cooldown(1.5)
+        _evt("stopped pid=%s" % (child.pid if child else -1))
+        self._last_stop_mono = time.monotonic()
         return {"stopped": True, "accounting": receipt}
+
+    def _post_kill_cooldown(self, seconds: float = 1.5) -> None:
+        """taskkill 枚举目标与执行之间有间隙；Windows 会极快复用 PID。
+        停止后短暂冷却，避免下一代的 worker 出生即被打上旧清单的枪。"""
+        self._sleep(seconds)
+
+    def _wait_vram_settle(self, window: float = 8.0) -> None:
+        """After a RECENT stop, give WDDM a moment to reclaim VRAM so the new engine
+        measures free memory correctly (negative-cache-budget guard). No-op on first
+        boot or when the last stop is older than the window."""
+        last = getattr(self, "_last_stop_mono", None)
+        if last is None:
+            return
+        elapsed = time.monotonic() - last
+        if elapsed >= window:
+            return
+        self._sleep(window - elapsed)
 
     def switch(
         self,
@@ -862,10 +1177,12 @@ class ServeManager:
         with self._cond:
             return self._child.pid if self._child is not None else None
 
-    def serve_args(self) -> list[str]:
-        """Engine args of the running (or last started) serve."""
+    def restart(self) -> dict:
+        """Restart the current serve generation (backend crashed while process alive)."""
         with self._cond:
-            return list(self._args)
+            model, port, args = self._model, self._port, list(self._args or [])
+        self.stop()
+        return self.start(model, port=port, args=args)
 
     def status(self) -> dict:
         with self._cond:

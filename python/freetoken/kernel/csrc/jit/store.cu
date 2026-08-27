@@ -82,16 +82,20 @@ struct StoreKernel {
         .with_dtype(dtype_)
         .verify(k)
         .verify(v);
-    TensorMatcher({L}) //
-        .with_device<kDLCUDA>(device_)
-        .with_dtype<int32_t, int64_t>(indices_dtype_)
-        .verify(indices);
+    /* MSVC 重载消歧：手工等价校验 */
+    RuntimeCheck(indices.dim() == 1, "StoreKernel: indices must be 1-D.");
+    RuntimeCheck(indices.size(0) == L.unwrap(),
+                 "StoreKernel: indices length mismatch.");
+    RuntimeCheck(indices.device().device_type == kDLCUDA,
+                 "StoreKernel: indices must be CUDA tensor.");
+    RuntimeCheck(indices.dtype().bits == 32 || indices.dtype().bits == 64,
+                 "StoreKernel: indices dtype must be int32/int64.");
 
     const auto dtype_size = dtype_bytes(dtype_.unwrap());
     RuntimeCheck(element_size == dtype_size * D.unwrap());
 
     const auto device = device_.unwrap();
-    const auto use_int32 = indices_dtype_.unwrap().bits == 32;
+    const auto use_int32 = indices.dtype().bits == 32;
     const auto length = static_cast<std::size_t>(L.unwrap());
     const auto kv_cache_stride = X.unwrap() * dtype_size;
     const auto kv_input_stride = Y.unwrap() * dtype_size;

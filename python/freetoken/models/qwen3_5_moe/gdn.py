@@ -118,6 +118,13 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv state in place by ``cache_indices`` slot. ``conv_in`` [total, conv_dim].
         ``cu_seqlens`` / ``cache_indices`` / ``has_initial_state`` come from FLAMetadata."""
         li = pool.local_index(self.layer_id)
+        # --kv-device cpu builds FLAMetadata index tensors on the host; the fused
+        # CUDA conv kernel rejects host pointers, so stage them onto the compute
+        # device here (tiny int32 payloads, negligible vs the prefill itself).
+        dev = conv_in.device
+        cu_seqlens = cu_seqlens.to(dev, non_blocking=True) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens
+        cache_indices = cache_indices.to(dev, non_blocking=True) if isinstance(cache_indices, torch.Tensor) else cache_indices
+        has_initial_state = has_initial_state.to(dev, non_blocking=True) if isinstance(has_initial_state, torch.Tensor) else has_initial_state
         x = conv_in.transpose(0, 1).contiguous()  # [conv_dim, total]
         out = causal_conv1d_varlen(x, self._conv_weight(), pool.conv_states[li],
                                    cu_seqlens, cache_indices, has_initial_state)
@@ -128,6 +135,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         updates conv state in place, no host loop -> CUDA-graph capturable.
         ``conv_in`` [B, conv_dim] -> silu(conv) [B, conv_dim]."""
         li = pool.local_index(self.layer_id)
+        table_idx = table_idx.to(conv_in.device, non_blocking=True) if isinstance(table_idx, torch.Tensor) else table_idx
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
 
     def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,

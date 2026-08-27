@@ -114,6 +114,74 @@ def _dequant_nvfp4_weight(
     return out.to(orig_device)
 
 
+_LAYER_ID_RE = re.compile(r"layers\.(\d+)\.")
+
+
+
+
+def _build_fuse_dispatch(*groups: dict) -> dict:
+    """Flatten fuse-group tables into an O(1) dispatch index.
+
+    Keyed by the tensor's LAST dotted segment (e.g. ``".q_proj"``) -> list of
+    ``(full_part_suffix, fused_suffix, part_idx)``. Per-tensor dispatch drops from
+    scanning every suffix of every group to <=2 candidate hits after one dict lookup;
+    this loop runs once per checkpoint tensor, so it compounds across ~2000 keys."""
+    out: dict = {}
+    for table in groups:
+        for fused_suffix, parts in table.items():
+            for idx, part in enumerate(parts):
+                seg = part[part.rfind("."):]
+                out.setdefault(seg, []).append((part, fused_suffix, idx))
+    return out
+
+
+# Lazily-built singleton dispatches (the fuse tables are defined further down the
+# module, so import-time construction would NameError).
+_FUSE_DISPATCH: dict | None = None
+_BF16_FUSE_DISPATCH: dict | None = None
+
+
+def _fp8_dispatch() -> dict:
+    """O(1) fp8-fusion part index (built once, on first tensor seen)."""
+    global _FUSE_DISPATCH
+    if _FUSE_DISPATCH is None:
+        _FUSE_DISPATCH = _build_fuse_dispatch(_CT_FP8_FUSE)
+    return _FUSE_DISPATCH
+
+
+def _bf16_dispatch() -> dict:
+    """O(1) bf16/nvfp4-fusion part index (built once, on first tensor seen)."""
+    global _BF16_FUSE_DISPATCH
+    if _BF16_FUSE_DISPATCH is None:
+        _BF16_FUSE_DISPATCH = _build_fuse_dispatch(_CT_BF16_FUSE)
+    return _BF16_FUSE_DISPATCH
+
+
+def _layer_id_of(name: str) -> int:
+    """Decoder-layer id embedded in a checkpoint key (-1 when absent)."""
+    m = _LAYER_ID_RE.search(name)
+    return int(m.group(1)) if m else -1
+
+
+def _dequant_ct_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """compressed-tensors FP8 dense weight -> bf16 (per-channel / per-tensor static scales).
+
+    Qwen3.8-27B-NVFP4 这类 mixed-precision checkpoint 把 attention/GDN-in_proj/lm_head/尾部 MLP
+    存成裸 float8 .weight + .weight_scale（无 .weight_packed 后缀）。引擎全 bf16 计算，
+    且 GDN in_proj 四路融合要求 dtype 一致——必须在这里按 scale 反量化，否则
+    torch.cat 会抛 Promotion for Float8 Types is not supported。"""
+    w = weight.to(torch.float32)
+    s = scale.to(torch.float32)
+    if s.dim() == 0:
+        out = w * s
+    elif s.dim() == 1:
+        s2 = s.reshape(-1, 1) if s.shape[0] == w.shape[0] else s.reshape(1, -1)
+        out = w * s2
+    else:
+        out = w * s
+    return out.to(torch.bfloat16)
+
+
 def _load_maybe_quantized(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
     """Load ``raw_name``; if it is a quantized ``.weight`` with sibling modelopt scales in
     the same shard, dequantize to bf16 (NVFP4 if ``weight_scale_2`` present, else FP8).
@@ -133,8 +201,8 @@ def _load_maybe_quantized(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
 
 def _rename(raw_name: str) -> str | None:
     """HF key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
-        return None
+    if raw_name.startswith(("model.visual.", "visual.")):  # mtp.* preserved
+        return None  # mtp.* is preserved for MTP speculative decoding
     # ModelOpt FP8 KV-cache static scales (full-attention layers only). FreeToken keeps the
     # KV cache in the engine's native precision (>= the checkpoint's quantized KV), so these
     # per-tensor q/k/v scales are unused -- drop them rather than fail as unexpected keys.
@@ -181,11 +249,16 @@ def iter_weights(
     config = parse_config(hf_config)
     if _compressed_tensors_nvfp4(hf_config):
         # Dense compressed-tensors NVFP4 (e.g. Qwen3.6-27B): attn (q/k/v/o, GDN out_proj) +
-        # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16.
+        # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16. Mixed FP8+NVFP4
+        # exports (Qwen3.8-27B) keep attention native W8A16 and tail-MLP layers FP8 too.
         yield from _iter_weights_compressed_tensors(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
             nvfp4=config.dense_quant == "nvfp4",
+            attn_quant=config.attn_quant,
+            fp8_mlp_layers=frozenset(
+                lid for lid, q in getattr(config, "layer_dense_quant_map", ()) if q == "fp8"
+            ),
         )
         return
     if config.expert_quant == "fp8_block":
@@ -551,6 +624,21 @@ _CT_BF16_FUSE: dict[str, tuple[str, ...]] = {
         ".linear_attn.in_proj_b", ".linear_attn.in_proj_a",
     ),
 }
+# bf16 grouping under a W8A16 attention checkpoint (Qwen3.8-27B): GDN splits into the fp8
+# qkvz GEMM and a bf16 b|a GEMM, so b/a fuse among themselves instead of all four.
+_CT_BF16_FUSE_BA: dict[str, tuple[str, ...]] = {
+    ".linear_attn.in_proj_ba": (".linear_attn.in_proj_b", ".linear_attn.in_proj_a"),
+}
+# Native-FP8 fusions (weight fp8-e4m3 + per-row fp32 scale; scales concatenate per part):
+_CT_FP8_FUSE: dict[str, tuple[str, ...]] = {
+    ".linear_attn.in_proj_qkvz": (".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z"),
+    ".self_attn.qkv_proj": (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"),
+    ".mlp.gate_up_proj": (".mlp.gate_proj", ".mlp.up_proj"),
+}
+# Standalone FP8 projections emitted as .weight + .weight_scale with no fusion.
+_CT_FP8_STANDALONE_SUFFIXES = (
+    ".self_attn.o_proj", ".linear_attn.out_proj", ".mlp.down_proj",
+)
 # The scale suffixes and parts/fuse machinery are shared with muse_glimmer and live
 # in models/loader.py.
 _CT_SCALE_SUFFIXES = CT_SCALE_SUFFIXES
@@ -564,7 +652,7 @@ def _ct_nvfp4_fuse(base: str, parts_tuple: tuple, buf: dict):
 
 def _iter_weights_compressed_tensors(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
-    nvfp4: bool,
+    nvfp4: bool, attn_quant: str = "none", fp8_mlp_layers: frozenset = frozenset(),
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Dense pass for a compressed-tensors NVFP4 checkpoint (e.g. Qwen3.6-27B).
 
@@ -582,11 +670,18 @@ def _iter_weights_compressed_tensors(
     tp_info = get_tp_info()
     nvfp4_buf: dict[str, dict[int, tuple]] = {}
     bf16_buf: dict[str, dict[int, torch.Tensor]] = {}
+    fp8_buf: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+    # Under W8A16 attention the bf16 GDN parts fuse b|a only (qkv/z are native FP8).
+    bf16_groups = _CT_BF16_FUSE_BA if attn_quant == "fp8_pertensor" else _CT_BF16_FUSE
+    # FREETOKEN_CT_FP8=bf16 (--ct-fp8 bf16) forces the dequant-at-load reference path;
+    # "native" (default) keeps float8 weights on the W8A16 kernel.
+    fp8_native = (attn_quant == "fp8_pertensor" or bool(fp8_mlp_layers)) and \
+        os.environ.get("FREETOKEN_CT_FP8", "native") != "bf16"
 
     def _emit_bf16_weight(name: str, tensor: torch.Tensor):
         """Plain bf16 ``.weight``: GDN in_proj fusion, Gemma (1+w) norms, else passthrough."""
         base = name[: -len(".weight")]
-        emit = _ct_bf16_fuse(base, tensor, bf16_buf, _CT_BF16_FUSE)
+        emit = _ct_bf16_fuse(base, tensor, bf16_buf, bf16_groups)
         if emit is not None:
             yield from emit
             return
@@ -605,8 +700,8 @@ def _iter_weights_compressed_tensors(
             disable=not tp_info.is_primary(),
         ):
             for raw_name in reader.names_in(file):
-                if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
-                    continue
+                if raw_name.startswith(("model.visual.", "visual.")):  # mtp.* preserved
+                    continue  # mtp.* preserved for MTP speculative decoding
                 if raw_name.endswith(_CT_SCALE_SUFFIXES):
                     continue  # consumed with weight_packed (or unused W4A4 activation scales)
 
@@ -621,7 +716,7 @@ def _iter_weights_compressed_tensors(
                     # GDN in_proj_* compute in bf16 (model contract) but some checkpoints
                     # (e.g. sakamakismile/Qwen3.6-27B-NVFP4) quantize them too: dequant to
                     # bf16 here and let the bf16 fusion assemble ``in_proj`` as usual.
-                    if any(base.endswith(p) for ps in _CT_BF16_FUSE.values() for p in ps):
+                    if next((True for s, _, _ in _bf16_dispatch().get(base[base.rfind("."):], ()) if base.endswith(s)), False):
                         bf16 = _dequant_nvfp4_weight(w, s, g[:1])
                         yield from _emit_bf16_weight(base + ".weight", bf16)
                         continue
@@ -645,7 +740,70 @@ def _iter_weights_compressed_tensors(
                     continue
 
                 if name.endswith(".weight"):
-                    yield from _emit_bf16_weight(name, reader.get_tensor(raw_name))
+                    t = reader.get_tensor(raw_name)
+                    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                        try:
+                            scale = reader.get_tensor(raw_name + "_scale").reshape(-1).to(torch.float32)
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"compressed-tensors FP8 weight {raw_name!r} lacks a sibling "
+                                f".weight_scale; cannot load it safely"
+                            ) from exc
+                        base = name[: -len(".weight")]
+                        # Native W8A16 path (attention under fp8_pertensor; per-layer FP8 MLP):
+                        # keep the weight float8 -- halves resident bytes AND decode bandwidth
+                        # vs dequant-at-load. lm_head and anything unlisted falls back to bf16.
+                        # Native FP8 lm_head: the untied vocab GEMM stays W8A16 instead of
+                        # dequantizing to a 2.5 GB bf16 resident matrix (headroom mandate).
+                        _lm_head_native = (
+                            base == "lm_head"
+                            and os.environ.get("FREETOKEN_LM_HEAD_FP8_NATIVE", "1") != "0"
+                        )
+                        # O(1) dispatch: candidates keyed by last dotted segment.
+                        _seg_hits = _fp8_dispatch().get(base[base.rfind("."):], ())
+                        # Pass the full (part_suffix, fused_suffix, idx) triple through.
+                        _fp8_hit = next(
+                            (h for h in _seg_hits if base.endswith(h[0])),
+                            None,
+                        )
+                        if fp8_native and (
+                            _lm_head_native
+                            or _fp8_hit is not None
+                            or base.endswith(_CT_FP8_STANDALONE_SUFFIXES)
+                            or (_layer_id_of(name) in fp8_mlp_layers)
+                        ):
+                            if _lm_head_native:
+                                # Fp8PerTensorLinear expects per-row scales [out].
+                                if scale.numel() == 1:
+                                    scale = scale.expand(t.shape[0]).contiguous()
+                                yield name, t
+                                yield base + ".weight_scale", scale
+                                continue
+                            if _fp8_hit is not None:
+                                _part, fused_suffix, _idx = _fp8_hit
+                                slots = fp8_buf.setdefault(base[: -len(_part)] + fused_suffix, {})
+                                slots[_idx] = (t, scale)
+                            else:
+                                yield name, t
+                                yield base + ".weight_scale", scale
+                                continue
+                            key = base[: -len(_part)] + fused_suffix
+                            slots = fp8_buf[key]
+                            if len(slots) < len(_CT_FP8_FUSE[fused_suffix]):
+                                continue
+                            del fp8_buf[key]
+                            yield key + ".weight", torch.cat([slots[i][0] for i in range(len(_CT_FP8_FUSE[fused_suffix]))], dim=0)
+                            yield key + ".weight_scale", torch.cat([slots[i][1] for i in range(len(_CT_FP8_FUSE[fused_suffix]))], dim=0)
+                            continue
+                        # Fallback (lm_head / unknown): dequant to bf16, then normal fusing.
+                        bf16 = _dequant_ct_fp8(t, scale)
+                        emit = _ct_bf16_fuse(base, bf16, bf16_buf, _CT_NVFP4_FUSE)
+                        if emit is not None:
+                            yield from emit
+                            continue
+                        yield from _emit_bf16_weight(name, bf16)
+                        continue
+                    yield from _emit_bf16_weight(name, t)
                     continue
 
                 # A_log / dt_bias (kept fp32 by the model; the load downcast exempts them).
@@ -655,6 +813,7 @@ def _iter_weights_compressed_tensors(
 
     assert not nvfp4_buf, f"Incomplete NVFP4 fusions: {list(nvfp4_buf.keys())}"
     assert not bf16_buf, f"Incomplete bf16 fusions: {list(bf16_buf.keys())}"
+    assert not fp8_buf, f"Incomplete FP8 fusions: {list(fp8_buf.keys())}"
 
 
 def iter_weights_parallel(

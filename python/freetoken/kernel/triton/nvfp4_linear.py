@@ -817,6 +817,19 @@ def nvfp4_transpose_resident(weight: torch.Tensor, weight_scale: torch.Tensor):
     the GEMV/dot-GEMM weight loads coalesce along N (the tile's wide axis), lifting batched
     decode from ~18% to ~35% and M=1 from ~50% to ~60-70% of the weight-bandwidth roof on
     H100. Done once at load; the transform is an exact permutation."""
+    # On WDDM shared-memory cards the .t().contiguous() scatter pattern thrashes
+    # driver page recall (minutes PER LAYER at 27B). Repack on the host instead:
+    # a CPU transpose of the 89 MB block is sub-second, then one clean DMA back.
+    if (
+        weight.device.type == "cuda"
+        and os.environ.get("FREETOKEN_NVFP4_T_ON_GPU", "0") != "1"
+    ):
+        w_cpu = weight.detach().cpu()
+        s_cpu = weight_scale.detach().cpu()
+        return (
+            w_cpu.view(torch.int32).t().contiguous().to(weight.device),
+            s_cpu.t().contiguous().to(weight.device),
+        )
     return (
         weight.view(torch.int32).t().contiguous(),
         weight_scale.t().contiguous(),
@@ -844,6 +857,30 @@ def nvfp4_dense_linear_t(
 # BaseOP linear layers (TP=1, replicated). Buffers: uint8 packed ``weight`` + fp8 block
 # ``weight_scale`` + fp16 per-row ``weight_global``.
 # ======================================================================================
+# Module-level switch controlling the row-major snapshot taken in
+# ``Nvfp4DenseLinear.load_state_dict``:
+#   "off"  -- keep no snapshot (default). The snapshot only exists for the iGPU
+#             D3D12 FFN offload; pure-dGPU serving saves ~3 GB by not keeping a
+#             second copy of every packed NVFP4 weight.
+#   "cuda" -- clone on the weight's own device (legacy behavior).
+#   "cpu"  -- copy straight to host memory (iGPU offload mode): no second
+#             dGPU-resident copy during load, and the executor consumes the
+#             host tensor without a later CUDA->CPU hop.
+NVFP4_ROW_MAJOR_MODE = "off"
+
+
+def set_nvfp4_row_major_mode(mode: str) -> None:
+    """Select where ``_weight_row_major`` snapshots live.
+
+    The engine calls this BEFORE weight loading when --dense-ffn-engine igpu
+    is active. See ``NVFP4_ROW_MAJOR_MODE`` for semantics."""
+    global NVFP4_ROW_MAJOR_MODE
+    if mode not in ("off", "cuda", "cpu"):
+        raise ValueError("invalid NVFP4 row-major mode: %r" % (mode,))
+    NVFP4_ROW_MAJOR_MODE = mode
+
+
+
 class Nvfp4DenseLinear(BaseOP):
     """Replicated NVFP4 dense linear (W4A16). Drop-in for ``LinearReplicated`` /
     ``LinearRowParallel`` at TP=1 on the mixed-precision checkpoint's NVFP4 dense weights.
@@ -861,12 +898,24 @@ class Nvfp4DenseLinear(BaseOP):
         self.weight_global = torch.empty(out_features, dtype=torch.float16)
         self.bias = torch.empty(out_features) if has_bias else None
         self._transposed = False
+        self._weight_row_major = None
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
         w = state_dict.pop(_concat_prefix(prefix, "weight"))
         s = state_dict.pop(_concat_prefix(prefix, "weight_scale"))
         assert w.shape == self.weight.shape and w.dtype == torch.uint8
         assert s.shape == self.weight_scale.shape
+        # Row-major snapshot of the original packed weight: the iGPU D3D12 W4A8 GEMV shader
+        # expects this layout. The dGPU kernels (nvfp4_dense_linear_t) use the K-major transposed
+        # view set below. ~50% extra memory at load, paid once.
+        if NVFP4_ROW_MAJOR_MODE == "off":
+            self._weight_row_major = None
+        elif NVFP4_ROW_MAJOR_MODE == "cpu":
+            # Snapshot to host immediately: no second dGPU-resident copy, and the
+            # iGPU executor gets host memory without a later CUDA->CPU hop.
+            self._weight_row_major = w.detach().to("cpu", copy=True)
+        else:
+            self._weight_row_major = w.detach().clone()
         self.weight, self.weight_scale = nvfp4_transpose_resident(w, s)
         self.weight_global = state_dict.pop(_concat_prefix(prefix, "weight_global"))
         if self.bias is not None:
@@ -937,5 +986,6 @@ __all__ = [
     "nvfp4_transpose_resident",
     "Nvfp4DenseLinear",
     "Nvfp4DenseColMerged",
+    "set_nvfp4_row_major_mode",
     "Nvfp4LMHead",
 ]

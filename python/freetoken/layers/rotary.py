@@ -74,6 +74,11 @@ class RotaryEmbedding(StateLessOP):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # _cos_sin_cache is built on CPU in __init__ (torch.arange default) and the
+        # rope kernel pins q/k to ITS device -- without this hop attention lands
+        # on CPU and store_kv dies on a cuda/cpu mismatch.
+        if self._cos_sin_cache.device != query.device:
+            self._cos_sin_cache = self._cos_sin_cache.to(query.device)
         self.apply_rope_with_cos_sin_cache_inplace(
             positions=positions,
             query=query,

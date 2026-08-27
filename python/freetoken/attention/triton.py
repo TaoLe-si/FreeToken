@@ -130,6 +130,45 @@ class TritonAttentionBackend(BaseAttnBackend):
             device=self.device,
         )
 
+    def _forward_cpu_attention(self, q, k, v, k_raw, v_raw, metadata, spec, layer_id):
+        """Host-pool attention: page-gather + torch SDPA, all on CPU."""
+        import torch.nn.functional as _F
+
+        kv_heads = k_raw.shape[-2]
+        head_dim = k_raw.shape[-1]
+        k_cache = k_raw.view(-1, kv_heads, head_dim)
+        v_cache = v_raw.view(-1, kv_heads, head_dim)
+
+        use_swa = spec is not None and spec.sliding_window is not None \
+            and getattr(metadata, "swa_indices", None) is not None
+        idx = metadata.swa_indices if use_swa else metadata.indices
+        scale = spec.sm_scale if (spec is not None and spec.sm_scale is not None) else q.shape[-1] ** -0.5
+
+        idx_c = idx.detach().to("cpu", non_blocking=True)
+        Kg = k_cache.index_select(0, idx_c)   # [total_kv, Hkv, D]
+        Vg = v_cache.index_select(0, idx_c)
+        qc = q.detach().to("cpu", non_blocking=True)
+
+        indptr = metadata.indptr.detach().to("cpu")
+        cu_q = (metadata.cu_seqlens_q_gpu if metadata.is_decode else metadata.cu_seqlens_q_gpu)
+        cu_q = cu_q.detach().to("cpu") if cu_q is not None else None
+        nreq = indptr.numel() - 1
+        Hq = qc.shape[1]; D = qc.shape[-1]
+        out = torch.empty(qc.shape[0], Hq, D, dtype=qc.dtype)
+        off_q = 0
+        for i in range(nreq):
+            ks, ke = int(indptr[i]), int(indptr[i + 1])
+            ki = Kg[ks:ke].transpose(0, 1)     # [Hkv, Lkv, D]
+            vi = Vg[ks:ke].transpose(0, 1)
+            qs, qe = (int(cu_q[i]), int(cu_q[i + 1])) if cu_q is not None else (i, i + 1)
+            qi = qc[qs:qe].transpose(0, 1)     # [Hq, Lq, D]
+            o = _F.scaled_dot_product_attention(
+                qi.unsqueeze(0), ki.unsqueeze(0), vi.unsqueeze(0),
+                scale=scale, enable_gqa=(Hq != kv_heads),
+            )
+            out[qs:qe] = o.squeeze(0).transpose(0, 1)
+            off_q = qe
+        return out.to(q.device, non_blocking=True)
     def forward(
         self,
         q: torch.Tensor,
@@ -148,6 +187,16 @@ class TritonAttentionBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, TritonMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+
+        _k_raw0 = self.kvcache.k_cache(layer_id)
+        if not _k_raw0.is_cuda:
+            # Host-resident pool (--kv-device cpu): the triton kernels assert on
+            # device tensors. Gather THIS batch's KV rows on host and run SDPA;
+            # host RAM bandwidth (~50 GB/s) beats PCIe spill reads at long ctx.
+            return self._forward_cpu_attention(
+                q, k, v, _k_raw0, self.kvcache.v_cache(layer_id),
+                metadata, attn_spec, layer_id,
+            )
 
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)

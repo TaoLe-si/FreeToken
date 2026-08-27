@@ -307,6 +307,10 @@ class OffloadMoELayer(MoELayer):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
+        if cache.is_igpu_layer(self.layer_id):
+            executor = cache.igpu_executor
+            assert executor is not None, "iGPU MoE executor was not initialized"
+            return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)

@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+# FreeToken fix: 优先使用 CUDA 12.6（cudafe++ 在 v13.0 + VS2026 下会原生段错误）
+import os as _ft_os
+if "CUDA_HOME" not in _ft_os.environ and "CUDA_PATH" not in _ft_os.environ:
+    _v126 = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+    if _ft_os.path.isdir(_v126):
+        _ft_os.environ["CUDA_HOME"] = _v126
+        _ft_os.environ["CUDA_PATH"] = _v126
+
+
 import importlib
 import os
 import pathlib
@@ -155,11 +164,13 @@ def _load_prebuilt(name: str) -> Module | None:
             )
         return None
 
-    so_path = cache_dir / name / f"{name}.so"
-    if so_path.exists():
-        import tvm_ffi
+    # Windows 预建产物是 .dll（Linux 才是 .so）；逐个探测平台后缀
+    for _ext in (".so", ".dll", ".pyd"):
+        so_path = cache_dir / name / f"{name}{_ext}"
+        if so_path.exists():
+            import tvm_ffi
 
-        return tvm_ffi.load_module(str(so_path))
+            return tvm_ffi.load_module(str(so_path))
 
     if _env_enabled(DISABLE_JIT_ENV):
         raise RuntimeError(
@@ -195,6 +206,9 @@ def load_aot(
     extra_include_paths: List[str] | None = None,
     build_directory: str | None = None,
 ) -> Module:
+    import platform as _pf
+    if _pf.system() == "Windows":
+        _ensure_msvc_in_path()
     name = _make_name(*args)
     prebuilt = _load_prebuilt(name)
     if prebuilt is not None:
@@ -227,6 +241,54 @@ def load_aot(
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
     )
+
+
+
+def _ensure_msvc_in_path() -> None:
+    """Windows 自愈：VS 已装但 cl.exe 不在 PATH 时，经 vswhere 定位并注入。"""
+    import glob
+    import os as _os
+    import shutil as _sh
+    if _sh.which("cl.exe"):
+        return
+    vsw = r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+    if not _os.path.exists(vsw):
+        return
+    # CUDA 认证矩阵优先：14.4x(VS2022 工具集) > 其余。VS2026(v145/14.5x) 的
+    # cudafe++ 在 CUDA13 下会原生段错误，绝不能入选。
+    roots = [r"C:\Program Files\Microsoft Visual Studio\18",
+             r"C:\Program Files (x86)\Microsoft Visual Studio\18",
+             r"C:\Program Files\Microsoft Visual Studio\2022",
+             r"C:\Program Files (x86)\Microsoft Visual Studio\2022"]
+    pats = [r"VC\Tools\MSVC\14.4*\bin\Hostx64\x64",
+            r"VC\Tools\MSVC\*\bin\Hostx64\x64"]
+    for pat in pats:
+        for root in roots:
+            for bindir in glob.glob(_os.path.join(root, pat)):
+                if not glob.glob(_os.path.join(bindir, "cl.exe")):
+                    continue
+                _os.environ["PATH"] = bindir + _os.pathsep + _os.environ.get("PATH", "")
+                _parts = bindir.split("MSVC")
+                _ver = _parts[-1].strip("\\").split("\\")[0]
+                _os.environ["VCToolsVersion"] = _ver
+                return
+    try:
+        import subprocess as _sp
+        vsw = r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+        if not _os.path.exists(vsw):
+            return
+        out = _sp.run([vsw, "-latest", "-products", "*",
+                       "-property", "installationPath"],
+                      capture_output=True, text=True, timeout=20).stdout or ""
+        for root in out.splitlines():
+            root = root.strip()
+            if not root:
+                continue
+            for bindir in glob.glob(_os.path.join(root, "VC", "Tools", "MSVC", "*", "bin", "Hostx64", "x64")):
+                _os.environ["PATH"] = bindir + _os.pathsep + _os.environ.get("PATH", "")
+                return
+    except Exception:
+        pass
 
 
 def load_jit(

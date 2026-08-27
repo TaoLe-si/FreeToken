@@ -10,6 +10,12 @@ from __future__ import annotations
 
 import os
 import signal
+
+try:
+    _SIGKILL = signal.SIGKILL
+except AttributeError:
+    _SIGKILL = signal.SIGTERM
+
 import subprocess
 import sys
 import threading
@@ -150,7 +156,7 @@ class CheckpointManager:
         cancel-during-spawn path)."""
         osproc.signal_group(child.pid, signal.SIGTERM)
         if not child.reaped.wait(timeout=self._grace_s):
-            osproc.signal_group(child.pid, signal.SIGKILL)
+            osproc.signal_group(child.pid, _SIGKILL)
 
     def status(self) -> dict:
         with self._lock:

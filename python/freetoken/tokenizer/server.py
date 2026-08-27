@@ -162,6 +162,11 @@ def tokenize_worker(
                 pending_msg.extend(_unwrap_msg(recv_listener.get()))
 
             logger.debug(f"Received {len(pending_msg)} messages")
+            logger.info_rank0(
+                "[dbg-pipe] recv %d msgs (dtok=%d tok=%d abort=%d)",
+                len(pending_msg), len(detokenize_msg) if 'detokenize_msg' in dir() else -1,
+                -1, -1,
+            )
 
             detokenize_msg = [m for m in pending_msg if isinstance(m, DetokenizeMsg)]
             tokenize_msg = [m for m in pending_msg if isinstance(m, TokenizeMsg)]

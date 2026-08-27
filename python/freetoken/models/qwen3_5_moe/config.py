@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from typing import Any
 
 from freetoken.models.config import (
@@ -7,6 +9,7 @@ from freetoken.models.config import (
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
+    detect_compressed_tensors_fp8_groups,
     detect_compressed_tensors_nvfp4,
 )
 
@@ -183,8 +186,24 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # the dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms stay bf16. Wire the shared
     # W4A16 kernels (attn_quant=="nvfp4" routes the attention/GDN linears through them too).
     if _compressed_tensors_nvfp4(hf_config):
-        attn_quant = "nvfp4"
+        # This family spans pure-NVFP4 exports (every dense projection W4A16) AND mixed
+        # FP8+NVFP4 ones (Qwen3.8-27B: attention/GDN-in_proj-qkvz/lm_head/tail-MLP are FP8,
+        # other MLP layers NVFP4-packed). Route attention to the W8A16 kernel when the
+        # checkpoint says so instead of forcing nvfp4 and dying on a dtype mismatch.
+        ct_attn_fp8, ct_mlp_fp8 = detect_compressed_tensors_fp8_groups(hf_config)
+        attn_quant = "fp8_pertensor" if ct_attn_fp8 else "nvfp4"
         dense_quant = "nvfp4"
+        # Native W8A16 head keeps the ~1.27 GB vocab matrix in fp8 instead of a 2.5 GB
+    # bf16 dequant -- the difference between clearing and violating the dGPU
+    # >=800 MiB headroom mandate on 8 GB cards. FREETOKEN_LM_HEAD_FP8_NATIVE=0
+    # restores the old dequant-at-load bf16 ParallelLMHead path.
+    # NVFP4 head wins when the checkpoint says so; fp8-native is the fallback for
+    # bf16-head checkpoints (env switch restores the dequant-at-load path).
+    if _lm_head_quant(hf_config) == "nvfp4":
+        lm_head_quant = "nvfp4"
+    elif os.environ.get("FREETOKEN_LM_HEAD_FP8_NATIVE", "1") != "0":
+        lm_head_quant = "fp8_pertensor"
+    else:
         lm_head_quant = "none"
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
@@ -257,6 +276,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_quant=attn_quant,
         dense_quant=dense_quant,
         lm_head_quant=lm_head_quant,
+        layer_dense_quant_map=tuple((i, "fp8") for i in sorted(ct_mlp_fp8))
+            if _compressed_tensors_nvfp4(hf_config) else (),
     )
 
 

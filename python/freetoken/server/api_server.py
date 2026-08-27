@@ -13,6 +13,17 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal
 
 import uvicorn
+
+# [ft-selector-loop-patch] uvicorn forces ProactorEventLoop on Windows main thread;
+# zmq.asyncio receive needs add_reader (selector). Our worker processes are spawned by
+# freetoken itself, so uvicorn never needs Proactor subprocess support -- always hand
+# back a SelectorEventLoop.
+try:
+    import asyncio as _ft_asyncio
+    import uvicorn.loops.asyncio as _ft_uvl
+    _ft_uvl.asyncio_loop_factory = lambda use_subprocess=False: _ft_uvl.asyncio.SelectorEventLoop
+except Exception:
+    pass
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken import __version__
@@ -243,18 +254,22 @@ class FrontendManager:
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
-            if isinstance(msg, CacheRebuildReply):
-                self._resolve_rebuild(msg)
-                continue
-            for msg in _unwrap_msg(msg):
-                # Global accounting follows actual admitted/sampled work even after the HTTP
-                # client disconnects and abort_user removes its ack queue. Delivery to a live
-                # request remains gated below, but observation must happen first.
-                self.stats.observe(msg)
-                if msg.uid not in self.ack_map:
+            logger.info_rank0("[dbg-fe] recv %s uid=%s", type(getattr(msg,'data',[msg])[0] if isinstance(msg, BatchFrontendMsg) else msg).__name__, getattr(msg,'uid','?'))
+            try:
+                if isinstance(msg, CacheRebuildReply):
+                    self._resolve_rebuild(msg)
                     continue
-                self.ack_map[msg.uid].append(msg)
-                self.event_map[msg.uid].set()
+                for msg in _unwrap_msg(msg):
+                    # Global accounting follows actual admitted/sampled work even after the HTTP
+                    # client disconnects and abort_user removes its ack queue. Delivery to a live
+                    # request remains gated below, but observation must happen first.
+                    self.stats.observe(msg)
+                    if msg.uid not in self.ack_map:
+                        continue
+                    self.ack_map[msg.uid].append(msg)
+                    self.event_map[msg.uid].set()
+            except Exception:
+                logger.exception("[dbg-fe] listen task error")
 
     def _resolve_rebuild(self, msg: CacheRebuildReply) -> None:
         """Terminal transition for a rebuild: rebuilding -> serving | failed. This is the ONLY
@@ -958,6 +973,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     install_polling_access_log_filter()
 
     assert _GLOBAL_STATE is None, "Global state is already initialized"
+    logger.info_rank0("[dbg-fe] frontend PULL binding on %s", config.zmq_frontend_addr)
     _GLOBAL_STATE = FrontendManager(
         config=config,
         recv_tokenizer=ZmqAsyncPullQueue(

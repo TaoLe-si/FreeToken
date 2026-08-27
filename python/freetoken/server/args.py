@@ -10,6 +10,68 @@ from freetoken.distributed import DistributedInfo
 from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
 
+_ZMQ_ADDR_CACHE: dict = {}
+
+
+_ZMQ_ADDR_CACHE: dict = {}
+
+
+def _zc_set(idx, suffix, addr):
+    _ZMQ_ADDR_CACHE[(idx, suffix)] = addr
+    return addr
+
+_zmq_transport_addr_patched = True  # 源码自带探测+缓存；shim 无需再包
+
+def _zmq_transport_addr(idx: int, suffix: str) -> str:
+    """Windows lacks the ZMQ ipc transport; use loopback TCP, deterministic port.
+
+    厂商常驻软件（华硕管家/应用商店等）会恰好监听在公式窗口内——连接它们将得到
+    无限期的无应答（10060），detokenizer 因此在装载期静默死亡。此处对候选端口做
+    bind 探测，被占用即向上避让。
+
+    [ft-zmq-env-sync] 探测结果经环境变量跨进程同步：主进程（前端）先分配并导出，
+    spawn 子进程继承环境后必须原样复用。否则子进程自己的 bind 探测会把前端真实
+    绑定视为"被占用"而避让，把回复推到无人监听的端口上。"""
+    import os
+    _k = (idx, suffix)
+    _c = globals().get('_ZMQ_ADDR_CACHE')
+    if _c is not None and _k in _c:
+        return _c[_k]
+    env_key = "FREETOKEN_ZMQ_ADDR_%d" % idx
+    inherited = os.environ.get(env_key)
+    if inherited:
+        if _c is not None:
+            _c[_k] = inherited
+        return inherited
+    addr = None
+    if os.name == "nt":
+        import socket as _socket
+        seed = 0
+        for ch in suffix:
+            if ch.isdigit():
+                seed = seed * 10 + int(ch)
+        start = 34000 + idx * 10 + (seed % 400)
+        for offset in range(0, 500):
+            candidate = start + offset
+            try:
+                with _socket.socket() as _sk:
+                    _sk.bind(("127.0.0.1", candidate))
+            except OSError:
+                continue
+            addr = "tcp://127.0.0.1:%d" % candidate
+            break
+        if addr is None:
+            addr = "tcp://127.0.0.1:%d" % start
+    else:
+        addr = "ipc:///tmp/freetoken_%d%s" % (idx, suffix)
+    if _c is not None:
+        _c[_k] = addr
+    os.environ[env_key] = addr
+    return addr
+
+
+
+
 
 @dataclass(frozen=True)
 class ServerArgs(SchedulerConfig):
@@ -50,13 +112,13 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def zmq_frontend_addr(self) -> str:
-        return "ipc:///tmp/freetoken_3" + self._unique_suffix
+        return _zmq_transport_addr(3, self._unique_suffix)
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = "ipc:///tmp/freetoken_4" + self._unique_suffix
+        result = _zmq_transport_addr(4, self._unique_suffix)
         assert result != self.zmq_detokenizer_addr
         return result
 
@@ -527,6 +589,27 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--ct-fp8",
+        choices=["native", "bf16"],
+        default=ServerArgs.ct_fp8,
+        help=(
+            "compressed-tensors FP8 handling: native = keep weights float8 and run the"
+            " W8A16 kernel (half the decode bandwidth); bf16 = dequantize to BF16 at load."
+        ),
+    )
+
+    parser.add_argument(
+        "--kv-device",
+        choices=["cuda", "shared", "cpu"],
+        default=ServerArgs.kv_device,
+        help=(
+            "KV cache placement: cuda = VRAM with strict startup budget; shared = allow the"
+            " pool to exceed free VRAM (Windows WDDM places overflow in the driver-managed"
+            " shared pool); cpu = host-resident KV (experimental)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
@@ -627,6 +710,29 @@ def parse_args(
         ),
     )
 
+    # Dense (B-group)
+    parser.add_argument(
+        "--dense-ffn-engine",
+        type=str,
+        default=ServerArgs.dense_ffn_engine,
+        choices=["cpu", "igpu", "gpu"],
+        help="Dense model FFN engine: cpu (DRAM), igpu (iGPU D3D12), gpu (VRAM)",
+    )
+
+    # iGPU
+    parser.add_argument(
+        "--igpu-service",
+        type=str,
+        default=ServerArgs.igpu_service,
+        help="iGPU D3D12 service executable path",
+    )
+    parser.add_argument(
+        "--igpu-no-fallback",
+        action="store_false",
+        dest="igpu_fallback",
+        help="Fail instead of falling back to CPU when iGPU is unavailable",
+    )
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 
@@ -715,3 +821,51 @@ def parse_args(
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell
+
+
+def _build_option_schema() -> dict:
+    """Extract the full CLI-options schema from the serve parser.
+    Returns {name: {type, default, choices, help, group}}.
+    """
+    import argparse
+    import re
+    from freetoken.moe import SUPPORTED_MOE_BACKENDS
+
+    parser = argparse.ArgumentParser(prog="ft serve", description="FreeToken Server Arguments")
+    # KV cache
+    kv = parser.add_argument_group("KV cache")
+    kv.add_argument("--page-size", type=int, default=16, help="KV page size (tokens)")
+    kv.add_argument("--max-batch-rows", type=int, default=None, help="Max KV pool rows")
+    kv.add_argument("--kv-device", choices=["cuda", "shared", "cpu"], default="cuda",
+                    help="KV placement: cuda (VRAM budget), shared (WDDM shared pool, may exceed VRAM), cpu (experimental)")
+    # MoE
+    moe = parser.add_argument_group("MoE / expert offload")
+    moe.add_argument("--moe-backend", choices=["auto"] + [n for n in SUPPORTED_MOE_BACKENDS.supported_names()], default=None, help="MoE decode backend")
+    moe.add_argument("--moe-cache-size", type=int, default=None, help="Expert cache slots")
+    moe.add_argument("--moe-cpu-layers", type=str, default=None, help="CPU layers (e.g. 0-5,7)")
+    # Dense (B-group)
+    dense = parser.add_argument_group("Dense (B-group engine)")
+    dense.add_argument("--dense-ffn-engine", choices=["cpu", "igpu", "gpu"], default="cpu", help="Dense model FFN engine: cpu (DRAM), igpu (iGPU D3D12), gpu (VRAM)")
+    # iGPU
+    igpu = parser.add_argument_group("iGPU D3D12")
+    igpu.add_argument("--igpu-service", type=str, default=None, help="iGPU D3D12 service exe")
+    igpu.add_argument("--igpu-no-fallback", action="store_true", default=False, help="Fail instead of falling back to CPU")
+
+    out: dict[str, dict] = {}
+    for group in parser._action_groups:
+        gname = group.title or "misc"
+        for action in group._group_actions:
+            opts = action.option_strings
+            if not opts:
+                continue
+            name = re.sub(r"^--", "", opts[0])
+            out[name] = {
+                "flags": opts,
+                "type": "int" if action.type is int else "float" if action.type is float else
+                        "bool" if isinstance(action, argparse._StoreTrueAction) else "str",
+                "default": None if action.default is None else action.default,
+                "choices": list(action.choices) if action.choices else None,
+                "help": action.help or "",
+                "group": gname,
+            }
+    return out

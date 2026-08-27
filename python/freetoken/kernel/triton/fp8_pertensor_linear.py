@@ -336,9 +336,33 @@ class Fp8PerTensorColMerged(Fp8PerTensorLinear):
         super().__init__(in_features, sum(output_sizes), has_bias)
 
 
+class Fp8LMHead(Fp8PerTensorLinear):
+    """Untied per-tensor-FP8 LM head (TP=1).
+
+    Same weight/scale tensors and layout as :class:`Fp8PerTensorLinear` (so
+    ``load_state_dict`` is inherited verbatim); forward slices to each sequence's
+    last token at prefill before the vocab-wide GEMV/GEMM."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        # Vocab-major head: rows are embeddings, so out=num_embeddings.
+        super().__init__(embedding_dim, num_embeddings)
+        # Checkpoints ship no lm_head bias; the inherited torch.empty(out) would
+        # stay on CPU and Triton rejects host pointers ("cpu tensor?").
+        self.bias = None
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        return super().forward(x)
+
+
 __all__ = [
     "FP8",
     "Fp8PerTensorLinear",
     "Fp8PerTensorColMerged",
+    "Fp8LMHead",
     "fp8_pertensor_linear",
 ]

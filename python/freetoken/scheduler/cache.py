@@ -274,6 +274,31 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def cache_req_to_len(self, req: Req, new_cached_len: int) -> None:
+        """Partial KV-cache commit/rollback for MTP speculative decoding.
+
+        After MTP head drafts K tokens, the request's valid prefix length is either:
+        - new_cached_len = old_cached_len + K  (all K accepted) -> commit K
+        - new_cached_len = old_cached_len + n  (n < K, partial accept) -> commit n
+        - new_cached_len = old_cached_len      (all rejected) -> full rollback
+
+        Orphaned pages in [new_cached_len, req.cached_len) are returned to the free list.
+        The attention backends gate reads on req.cached_len, so subsequent forwards
+        will not see the orphaned pages.
+        """
+        if new_cached_len < 0 or new_cached_len > req.cached_len:
+            raise ValueError(
+                f"new_cached_len={new_cached_len} must be in [0, req.cached_len={req.cached_len}]"
+            )
+        if new_cached_len == req.cached_len:
+            return
+        orphan = self.page_table[req.table_idx, new_cached_len : req.cached_len]
+        if self.is_swa:
+            self._free_swa(orphan)
+        self._free(orphan)
+        req.cached_len = new_cached_len
+
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)

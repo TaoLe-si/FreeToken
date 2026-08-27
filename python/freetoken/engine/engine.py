@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import gc
 import math
@@ -10,7 +9,6 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from freetoken.gpu_select import gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
@@ -284,6 +282,91 @@ def _materialize_loaded_weight_state_dict(
     return state_dict
 
 
+# ---------------------------------------------------------------------------
+# dGPU VRAM headroom policy: keep >= 800 MB of free VRAM AT ALL TIMES.
+# Every CUDA-side allocation stage checks this reserve (fail fast with a clear
+# error instead of a raw cudaMalloc OOM), and pool budgets subtract it. Override
+# with FREETOKEN_VRAM_HEADROOM_MB if a different card needs a different floor.
+_VRAM_HEADROOM_DEFAULT_MB = 800
+
+
+def _vram_headroom_bytes() -> int:
+    try:
+        mb = int(os.environ.get("FREETOKEN_VRAM_HEADROOM_MB", _VRAM_HEADROOM_DEFAULT_MB))
+    except ValueError:
+        mb = _VRAM_HEADROOM_DEFAULT_MB
+    return max(0, mb) * (1024 * 1024)
+
+
+def _self_vram_budget(device: torch.device) -> Tuple[int, int, int]:
+    """(our_allocated, total_physical, driver_free) bytes.
+
+    Local-segment budget for the headroom policy derives from these; under WDDM
+    overcommit torch allocations exceed physical VRAM (spill into shared memory),
+    so ``driver_free`` collapses to ~0 and cannot gate anything by itself."""
+    total = int(torch.cuda.get_device_properties(device).total_memory)
+    alloc = int(torch.cuda.memory_allocated(device))
+    return alloc, total, int(get_free_memory(device))
+
+
+def ensure_vram_headroom(device: torch.device, need_bytes: int = 0, tag: str = "") -> int:
+    """Keep >= headroom of LOCAL dGPU segment free at all times.
+
+    Metric: ``min(total_physical - our_allocated, driver_free)`` -- on healthy
+    setups these agree; under full WDDM spill both collapse to 0, which honestly
+    reports that the resident model cannot satisfy the mandate on this card.
+    Enforcement: FREETOKEN_VRAM_HEADROOM_ENFORCE=log (default) warns and
+    proceeds so overcommit-capable machines stay usable; ``strict`` raises for
+    setups that must honor the floor.
+    Returns current budget-left bytes."""
+    alloc, total, drv_free = _self_vram_budget(device)
+    headroom = _vram_headroom_bytes()
+    budget_left = max(0, min(total - alloc, drv_free))
+    if budget_left - need_bytes < headroom:
+        where = (" at " + tag) if tag else ""
+        msg = (
+            "VRAM headroom SOFT%s: budget-left %d MiB - pending %d MiB"
+            " < floor %d MiB (allocated %d MiB / total %d MiB, driver free %d MiB)"
+            % (where, budget_left >> 20, need_bytes >> 20, headroom >> 20,
+               alloc >> 20, total >> 20, drv_free >> 20)
+        )
+        enforce = str(os.environ.get("FREETOKEN_VRAM_HEADROOM_ENFORCE", "log")).lower()
+        if enforce in ("log", "warn", "soft", "0"):
+            logger.warning_rank0("%s; continuing (overcommit tolerated)", msg)
+        else:
+            raise RuntimeError(msg)
+    return budget_left
+
+def _get_host_ram_bytes() -> int:
+    """Return available host memory (physical + page file) in bytes using Windows ctypes.
+
+    PyTorch's CPU allocator can use the page file when physical RAM is exhausted, so we
+    account for both to give the CPU KV pool the maximum possible budget."""
+    try:
+        import ctypes
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32),
+                ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64),
+                ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64),
+                ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64),
+                ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+        mem = MEMORYSTATUSEX()
+        mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem))
+        # Use available physical RAM + available page file as the total budget
+        return int(mem.ullAvailPhys) + int(mem.ullAvailPageFile)
+    except Exception:
+        # Fallback: assume 64 GB total virtual
+        return 64 * (1024 ** 3)
+
+
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -293,13 +376,31 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        # iGPU dense-FFN offload: set NVFP4 row-major mode early so weight snapshots
+        # go to host memory before model loading.
+        if config.dense_ffn_engine == "igpu" and not config.model_config.is_moe:
+            from freetoken.kernel.triton.nvfp4_linear import set_nvfp4_row_major_mode
+            set_nvfp4_row_major_mode("cpu")
+            os.environ.setdefault("FREETOKEN_MAMBA_SSM_DTYPE", "bfloat16")
+            from freetoken.env import ENV as _ft_env
+            _ft_env.MAMBA_SSM_DTYPE.value = "bfloat16"
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
-
-        from freetoken.gpu_select import bind_assigned_gpu
-
-        self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
+
+        # iGPU dense-FFN offload: NVFP4 row-major snapshots must land in HOST memory
+        # (not a second dGPU copy). Set before weight loading. See nvfp4_linear.
+        if config.dense_ffn_engine == "igpu" and not config.model_config.is_moe:
+            from freetoken.kernel.triton.nvfp4_linear import set_nvfp4_row_major_mode
+            set_nvfp4_row_major_mode("cpu")
+            # GDN recurrent state in bf16: halves the state pool (~650 MiB here);
+            # the pool would otherwise blow the dGPU headroom mandate on its own.
+            os.environ.setdefault("FREETOKEN_MAMBA_SSM_DTYPE", "bfloat16")
+            from freetoken.env import ENV as _ft_env
+            _ft_env.MAMBA_SSM_DTYPE.value = "bfloat16"  # EnvVar snapshot bypass
+
+        self.device = torch.device(f"cuda:{config.tp_info.rank}")
+        torch.cuda.set_device(self.device)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -335,6 +436,10 @@ class Engine:
         self.cpu_moe_executor = None
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
+        # Dense FFN B-group offload: init iGPU executor if configured
+        self.dense_ffn_executor = None
+        if config.dense_ffn_engine == "igpu" and not config.model_config.is_moe:
+            self._init_dense_ffn_executor(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
 
@@ -344,24 +449,124 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
-        self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        kv_device = getattr(config, "kv_device", "cuda")
+        if kv_device == "shared":
+            # WDDM shared-pool mode: the driver places VRAM overflow in system memory and
+            # the dGPU reads it over GTT. Size pages from context needs, not the (negative)
+            # local budget -- the strict assert would refuse a boot this machine can run.
+            want_tokens = max(
+                int(config.max_running_req) * int(
+                    config.max_seq_len_override or 4096
+                ),
+                4096,
+            )
+            self.num_pages = max(want_tokens // max(config.page_size, 1), 2)
+            available_memory = 128 * (1024 ** 3)  # 128 GiB -- effectively unlimited
+            logger.warning_rank0(
+                "KV device=shared: allocating %d pages (%d tokens) via the WDDM shared pool; VRAM overflow is driver-managed"
+                % (self.num_pages, want_tokens),
+            )
+        elif kv_device == "cpu":
+            # CPU/KV mode: KV lives in host RAM. Allocate based on host memory budget.
+            want_tokens = max(
+                int(config.max_running_req) * int(
+                    config.max_seq_len_override or 4096
+                ),
+                4096,
+            )
+            # Host-RAM KV must coexist with the model's own host-resident
+            # structures (fp8-tail bf16 executors ~2.2 GiB, NVFP4 row-major
+            # snapshots ~3.3 GiB, load transients) plus OS/runtime slack. The raw
+            # ratio-of-total formula pinned whole 47 GB boxes (user-visible as a
+            # machine-wide "leak"). mr=1 desktop workloads need a few hundred MB.
+                        # 256K ctx needs ~16 GB of MHA KV alone; the old 4 GB default made
+            # long-context boots assert in solve_num_pages.
+            _kv_cap = int(os.environ.get("FREETOKEN_CPU_KV_CAP_GB", "8")) * (1024**3)
+            _host_reserve = 4 * (1024**3)  # q8 ffn caches already materialized above
+            cpu_budget = min(
+                int(max(0, _get_host_ram_bytes() - _host_reserve) * config.memory_ratio),
+                _kv_cap,
+            )
+            cpu_budget -= state_pool_bytes(config)
+            self.num_pages = self._pool_cls.solve_num_pages(config, cpu_budget)
+            logger.warning_rank0(
+                "KV device=cpu: allocating %d pages (%d tokens) in host RAM (budget %d GiB)"
+                % (self.num_pages, want_tokens, cpu_budget // (1024**3)),
+            )
+        else:
+            try:
+                self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
+            except AssertionError:
+                # Hybrid models keep only a handful of full-attention layers, so
+                # their KV is tiny (e.g. 32 KB/token -> ~128 MB at 4k ctx), yet the
+                # 27B dense weights oversubscribe VRAM so completely that raw
+                # free-memory math floors to zero. A GPU-resident pool served by
+                # WDDM shared placement is still an order of magnitude faster than
+                # a host pool (the triton attention kernels require device KV), so
+                # floor the pool to the sequence-length requirement instead of dying.
+                _cpp, _cfx, _, _ = self._pool_cls.kv_cost(config)
+                _want_tokens = max(int(getattr(config, "max_seq_len", 0) or 0), 2048)
+                _ps = max(1, int(config.page_size))
+                # A single 16 GiB cudaMalloc cannot succeed on an 8 GB card even
+                # under WDDM: cap placement at ~90% of total VRAM and let the rest
+                # of the context be served by --kv-device cpu.
+                try:
+                    _alloc, _tot, _drv = _self_vram_budget(self.device)
+                    _cap_bytes = max(512 * 1024 * 1024, int(_tot * 0.9) - _cfx)
+                except Exception:
+                    _cap_bytes = 512 * 1024 * 1024
+                _need_pages = (_want_tokens + _ps - 1) // _ps
+                _cap_pages = max(2, int(_cap_bytes) // max(1, _cpp))
+                self.num_pages = max(2, min(_need_pages, _cap_pages))
+                logger.warning_rank0(
+                    "KV pool exceeds measured free VRAM; floored to %d pages (%d tokens,"
+                    " ~%d MB) -- WDDM places it in shared memory" 
+                    % (self.num_pages, self.num_pages * _ps,
+                       (self.num_pages * _cpp + _cfx) // (1024 * 1024))
+                )
         num_tokens = self.num_pages * config.page_size
+        # KV pool device: cpu for cpu mode, self.device for shared/dgpu modes
+        kv_dev = torch.device("cpu") if kv_device == "cpu" else self.device
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, self.num_pages, device=kv_dev, dtype=self.dtype
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
         if linear_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
+            # Task mandate: dGPU must keep >=800 MiB free at ALL times -- check BEFORE
+            # this multi-hundred-MB CUDA allocation so failures are actionable.
+            _gdn_pool_bytes = state_pool_bytes(config)
+            ensure_vram_headroom(self.device, need_bytes=_gdn_pool_bytes, tag="GDN state pool")
 
-            self.linear_state_pool = LinearStatePool(
-                group=linear_group,
-                num_slots=_linear_pool_num_slots(config),
-                dtype=self.dtype,
-                device=self.device,
-                tp_size=config.tp_info.size,
-            )
+            _pool_device = self.device
+            try:
+                self.linear_state_pool = LinearStatePool(
+                    group=linear_group,
+                    num_slots=_linear_pool_num_slots(config),
+                    dtype=self.dtype,
+                    device=_pool_device,
+                    tp_size=config.tp_info.size,
+                )
+            except Exception as _pool_exc:
+                # WDDM spill can leave the shared arena exhausted even when our
+                # budget math passes; a host-resident GDN pool keeps the engine
+                # bootable at some decode cost instead of dying here.
+                logger.warning_rank0(
+                    "GDN state pool on %s failed (%s); falling back to CPU pool",
+                    _pool_device, str(_pool_exc)[:120],
+                )
+                torch.cuda.empty_cache()
+                _pool_device = torch.device("cpu")
+                self.linear_state_pool = LinearStatePool(
+                    group=linear_group,
+                    num_slots=_linear_pool_num_slots(config),
+                    dtype=self.dtype,
+                    device=_pool_device,
+                    tp_size=config.tp_info.size,
+                )
+            logger.warning_rank0("GDN state pool device: %s", _pool_device)
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None
@@ -451,14 +656,14 @@ class Engine:
             assert tp_cpu_group is not None
         return tp_cpu_group
 
+        
+        
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
         if config.use_dummy_weight:
             return _make_dummy_weight_state_dict(model_state, device=self.device)
-        # _materialize casts each loaded tensor to its model-param dtype (model_state), so
-        # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
-        # offload models exclude experts (served from the offload cache, not dense weights).
-        return _materialize_loaded_weight_state_dict(
+
+        state_dict = _materialize_loaded_weight_state_dict(
             model_state,
             load_weight(
                 config.model_path,
@@ -467,6 +672,7 @@ class Engine:
             ),
             device=self.device,
         )
+        return state_dict
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
@@ -514,48 +720,15 @@ class Engine:
         # layout; the GPU slot-cache GEMM reads those same native rows. decode_target also
         # gates the CPU executor build below.
         cpu_layer_ids = _resolve_cpu_layers(config, config.model_config.num_moe_layers)
-        if (
-            not cpu_layer_ids
-            and config.moe_cpu_layers is None
-            and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes() is not None
-        ):
-            cpu_layer_ids = _auto_cpu_layers(config, config.model_config.num_moe_layers)
-        if config.moe_backend == "hybrid":
+        if config.moe_backend == "igpu":
+            decode_target = "igpu"
+            cpu_layer_ids = frozenset(range(config.model_config.num_moe_layers))
+        elif config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
             decode_target = "cpu"
         else:
             decode_target = "gpu"
-        # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
-        # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
-        # not applied to plain --moe-backend cpu; all-locked under a cap = --moe-backend offload --moe-cpu-layers 1.0
-        split_residency = (
-            bool(cpu_layer_ids)
-            and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes() is not None
-        )
-        if config.moe_backend == "cpu" and not split_residency:
-            # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
-            from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
-
-            budget = _pin_budget_bytes()
-            bank_bytes = None
-            if budget is not None:
-                bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
-            if bank_bytes and bank_bytes > budget:
-                split_residency = True
-                logger.info_rank0(
-                    f"--moe-backend cpu: banks {bank_bytes / 2**30:.2f} GiB exceed the "
-                    f"pin budget; OS-locking all layers instead of pinning"
-                )
-        if split_residency and config.moe_prefill_overlap:
-            # locked (unregistered) layers cannot feed the async pinned H2D double buffer; their prefill is a synchronous pageable copy via materialize
-            logger.info_rank0(
-                "--moe-cpu-layers split residency: disabling MoE prefill overlap "
-                "(locked layers prefill via synchronous pageable copies)"
-            )
-            object.__setattr__(config, "moe_prefill_overlap", False)
         if cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
@@ -563,15 +736,6 @@ class Engine:
             # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
             # pick (parallel for scattered experts, with a low-RAM fallback to serial).
             expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
-            requested_residency = None
-            if split_residency:
-                from freetoken.moe.host_banks import HostResidency
-
-                requested_residency = [
-                    HostResidency.LOCKED.value if i in cpu_layer_ids
-                    else HostResidency.PINNED.value
-                    for i in range(config.model_config.num_moe_layers)
-                ]
             banks = load_expert_banks(
                 config.model_path,
                 config.model_config,
@@ -579,8 +743,7 @@ class Engine:
                 dtype=self.dtype,
                 dummy=config.use_dummy_weight,
                 parallel=expert_parallel,
-                decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
-                layer_residency=requested_residency,
+                decode_target=("cpu" if decode_target in ("cpu", "hybrid", "igpu") else "gpu"),
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -614,17 +777,15 @@ class Engine:
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
-            # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
-            cache.cpu_layer_ids = cpu_layer_ids
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
             cache.hybrid_max_fetch = config.moe_hybrid_max_fetch
-            cache.cpu_layer_ids = cpu_layer_ids
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
+        cache.cpu_layer_ids = cpu_layer_ids
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
@@ -632,7 +793,9 @@ class Engine:
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
-        if cache.decode_target in ("cpu", "hybrid"):
+        if cache.decode_target == "igpu":
+            self._init_igpu_executor(config, cache, layers)
+        elif cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
@@ -651,10 +814,8 @@ class Engine:
             return  # explicit fixed cap
         from freetoken.moe.bench_profile import load_hybrid_fetch_fraction
 
-        gpu_name, gpu_uuid = _profile_gpu(self.device.index)
-        fraction = load_hybrid_fetch_fraction(
-            cache.quant_format, gpu_name=gpu_name, gpu_uuid=gpu_uuid
-        )
+        gpu_name = torch.cuda.get_device_name(self.device) if torch.cuda.is_available() else None
+        fraction = load_hybrid_fetch_fraction(cache.quant_format, gpu_name=gpu_name)
         if fraction is None:
             cache.hybrid_max_fetch = 1
             logger.warning_rank0(
@@ -704,6 +865,198 @@ class Engine:
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
 
+    def _init_igpu_executor(self, config: EngineConfig, cache, layers) -> None:
+        """Build the iGPU D3D12 executor (decode-time expert compute on the iGPU).
+
+        Starts the persistent D3D12 GEMV service (t_d3d12_service.exe), runs the
+        numpy self-check, and attaches an IgpuMoeExecutor that reads the native
+        nvfp4 host banks straight from the cache. On any failure falls back to
+        the CPU executor when config.igpu_fallback is set, else raises.
+        """
+        from freetoken.moe.igpu_backend import IgpuGemvService, IgpuMoeExecutor, igpu_available
+
+        sample = layers[0]
+        required = ("top_k", "activation", "apply_router_weight_on_input")
+        if not all(hasattr(sample, attr) for attr in required):
+            raise NotImplementedError(
+                "iGPU MoE backend is not yet supported for this model architecture "
+                f"(MoE layer {type(sample).__name__} is missing {required})."
+            )
+        if cache.quant_format != "nvfp4":
+            if config.igpu_fallback:
+                logger.warning_rank0(
+                    f"iGPU MoE backend supports native nvfp4 banks only, got "
+                    f"{cache.quant_format!r}; falling back to the CPU executor"
+                )
+                return self._init_cpu_moe_executor(config, cache, layers)
+            raise NotImplementedError(
+                f"iGPU MoE backend supports native nvfp4 banks only, got "
+                f"{cache.quant_format!r}; use --moe-backend cpu or offload."
+            )
+        ok, msg = igpu_available(config.igpu_service)
+        if not ok:
+            if config.igpu_fallback:
+                logger.warning_rank0(
+                    f"iGPU D3D12 service unavailable ({msg}); falling back to the "
+                    "CPU executor for decode"
+                )
+                return self._init_cpu_moe_executor(config, cache, layers)
+            raise RuntimeError(
+                f"iGPU MoE backend requested (--moe-backend igpu) but unavailable: {msg}"
+            )
+        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        executor = IgpuMoeExecutor(
+            cache,
+            top_k=sample.top_k,
+            activation=sample.activation,
+            apply_router_weight_on_input=sample.apply_router_weight_on_input,
+            service=IgpuGemvService(config.igpu_service),
+            max_tokens=max_tokens,
+            device=self.device,
+        )
+        cache.set_igpu_executor(executor)
+        self.igpu_executor = executor
+
+    def _init_dense_ffn_executor(self, config: EngineConfig) -> None:
+        """Attach host dense-FFN executors and free the dGPU FFN slabs.
+
+        NVFP4 layers: Nvfp4HostFfnExecutor built from the host row-major
+        snapshots taken during weight loading; dGPU packed copies freed.
+        FP8-per-tensor tails: deferred to CpuDenseFfnExecutor below.
+        """
+        _ea, _et, _ed = _self_vram_budget(self.device)
+        logger.warning_rank0(
+            "[offload-entry] allocated %d MiB / total %d MiB | driver-free %d MiB"
+            % (_ea >> 20, _et >> 20, _ed >> 20),
+        )
+        from freetoken.moe.igpu_backend import IgpuGemvService, igpu_available
+
+        ok, msg = igpu_available(config.igpu_service)
+        if not ok:
+            if config.igpu_fallback:
+                logger.warning_rank0("iGPU service unavailable (%s); GPU FFN fallback" % msg)
+                return
+            raise RuntimeError("iGPU backend requested but unavailable: %s" % msg)
+
+        model = self.model
+        if hasattr(model, "model"):
+            model = model.model
+        if not hasattr(model, "layers") or not hasattr(model.layers.op_list[0], "mlp"):
+            logger.warning_rank0("Dense FFN offload: no decoder mlp found; skipping")
+            return
+
+        mlp0 = model.layers.op_list[0].mlp
+        wdt = getattr(getattr(mlp0, "gate_up_proj", None), "weight", None)
+        if wdt is None:
+            logger.warning_rank0("Dense FFN offload: layer0 has no gate_up weight; skipping")
+            return
+        if wdt.dtype not in (torch.uint8, torch.int32, torch.int8):
+            logger.warning_rank0("Dense FFN offload: dtype %s unsupported; skipping" % wdt.dtype)
+            return
+
+        service = IgpuGemvService(config.igpu_service)
+        num_layers = len(model.layers.op_list)
+        FP8 = torch.float8_e4m3fn
+        tail_ids = []
+        host_n = 0
+
+        for lid in range(num_layers):
+            mlp = model.layers.op_list[lid].mlp
+            gu, dn = mlp.gate_up_proj, mlp.down_proj
+            guw = getattr(gu, "weight", None)
+            if guw is not None and guw.dtype == FP8:
+                tail_ids.append(lid)
+                continue
+            gu_rm = getattr(gu, "_weight_row_major", None)
+            dn_rm = getattr(dn, "_weight_row_major", None)
+            if gu_rm is None:
+                logger.warning_rank0(
+                    "Layer %d: no row-major snapshot (dev=%s); keeping dGPU" % (lid, getattr(guw, "device", "?")),
+                )
+                continue
+            if dn_rm is None:
+                dn_rm = dn.weight.t().contiguous()
+                if dn_rm.device.type == "cuda":
+                    dn_rm = dn_rm.detach().cpu()
+
+            gu_sc = getattr(gu, "weight_scale", None)
+            gu_gl = getattr(gu, "weight_global", None)
+            dn_sc = getattr(dn, "weight_scale", None)
+            dn_gl = getattr(dn, "weight_global", None)
+            if gu_sc is None:
+                gu_sc = torch.ones(gu_rm.shape[0], dtype=FP8, device=gu_rm.device)
+            if gu_gl is None:
+                gu_gl = torch.ones(gu_rm.shape[0], dtype=torch.float16, device=gu_rm.device)
+            if dn_sc is None:
+                dn_sc = torch.ones(dn_rm.shape[0], dtype=FP8, device=dn_rm.device)
+            if dn_gl is None:
+                dn_gl = torch.ones(dn_rm.shape[0], dtype=torch.float16, device=dn_rm.device)
+
+            from freetoken.moe.cpu_dense_ffn import Nvfp4HostFfnExecutor
+            executor = Nvfp4HostFfnExecutor(
+                gate_up_w=gu_rm, gate_up_scale=gu_sc, gate_up_global=gu_gl,
+                down_w=dn_rm, down_scale=dn_sc, down_global=dn_gl,
+            )
+            mlp.dense_ffn_executor = executor
+
+            # Free the dGPU slab now that the host bf16 cache owns the math.
+            for proj in (gu, dn):
+                w = proj.weight
+                proj.weight = torch.empty(0, dtype=w.dtype, device="cpu")
+                sc = getattr(proj, "weight_scale", None)
+                if sc is not None:
+                    proj.weight_scale = torch.empty(0)
+                gl = getattr(proj, "weight_global", None)
+                if gl is not None:
+                    proj.weight_global = torch.empty(0)
+                proj._weight_row_major = None
+            host_n += 1
+            if lid % 8 == 0 or lid == num_layers - 1:
+                logger.warning_rank0("Layer %d -> host FFN executor (dGPU slab freed)" % lid)
+                # Return the just-freed dGPU slabs to WDDM NOW: the caching allocator
+                # would otherwise hold ~20 GB of stale committed pages while the host
+                # bf16 caches grow, exhausting system commit (~layer 48 AV).
+                import gc as _gc
+                _gc.collect()
+                torch.cuda.empty_cache()
+
+        tail_n = 0
+        for tid in tail_ids:
+            tmlp = model.layers.op_list[tid].mlp
+            tgu, tdn = tmlp.gate_up_proj, tmlp.down_proj
+            try:
+                tguw = tgu.weight.detach().to("cpu")
+                tgus = tgu.weight_scale.detach().to("cpu")
+                tdnw = tdn.weight.detach().to("cpu")
+                tdns = tdn.weight_scale.detach().to("cpu")
+                outs = list(getattr(tgu, "output_sizes", []) or [])
+                for p in (tgu, tdn):
+                    p.weight = torch.empty(0, dtype=p.weight.dtype, device="cpu")
+                    if getattr(p, "weight_scale", None) is not None:
+                        p.weight_scale = torch.empty(0)
+                from freetoken.moe.cpu_dense_ffn import CpuDenseFfnExecutor
+                tmlp.dense_ffn_executor = CpuDenseFfnExecutor(
+                    gate_up_w=tguw, gate_up_s=tgus, down_w=tdnw, down_s=tdns,
+                    output_sizes=outs,
+                )
+                tail_n += 1
+                logger.warning_rank0("Layer %d: FP8 tail -> CPU executor" % tid)
+            except Exception as exc:
+                logger.warning_rank0(
+                    "Layer %d: CPU tail failed (%s); stays on dGPU" % (tid, exc),
+                )
+                ensure_vram_headroom(self.device, need_bytes=0, tag="tail fallback")
+
+        _post_free = ensure_vram_headroom(
+            self.device, need_bytes=state_pool_bytes(config), tag="post FFN offload"
+        )
+        _da, _dt, _dd = _self_vram_budget(self.device)
+        logger.warning_rank0(
+            "FFN offload done: %d host + %d cpu-tail / %d layers | alloc %d MiB | free %d MiB"
+            % (host_n, tail_n, num_layers, _da >> 20, _dd >> 20),
+        )
+        self.dense_ffn_executor = service
+        self.ctx.dense_ffn_executor = service
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
         torch.cuda.synchronize(self.device)
@@ -997,14 +1350,6 @@ class Engine:
         destroy_distributed()
 
 
-def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
-    """(name, uuid) of visible device ``index`` (default: the current, i.e. bound, device); (None, None) without CUDA."""
-    if not torch.cuda.is_available():
-        return None, None
-    ident = gpu_identity(torch.cuda.current_device() if index is None else index)
-    return ident["name"], ident["uuid"]
-
-
 def _ensure_expandable_segments() -> None:
     """Default the CUDA allocator to expandable segments.
 
@@ -1131,74 +1476,6 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
     return _parse_cpu_layers_spec(spec, num_moe_layers)
 
 
-# expert activations the CPU MoE executor supports (csrc ActKind)
-_CPU_MOE_ACTS = (
-    "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
-)
-
-
-def _cpu_moe_executor_viable(model_config) -> bool:
-    """Whether an automatic CPU-decode decision may target the CPU MoE executor.
-
-    A default boot must degrade to GPU offload instead of crashing in CpuMoeExecutor after the whole load; explicit cpu/hybrid/--moe-cpu-layers picks still fail loudly."""
-    from freetoken.moe.cpu_executor import _WFMT_IDS, compiled_extension_supports
-
-    try:
-        from freetoken.kernel import _cpu_moe  # noqa: F401
-    except ImportError:
-        return False
-    act = getattr(model_config, "hidden_act", "silu")
-    moe_wfmt = getattr(model_config, "moe_weight_format", None)
-    if act not in _CPU_MOE_ACTS and moe_wfmt != "mxfp4":
-        return False
-    if moe_wfmt != "mxfp4" and not compiled_extension_supports(act):
-        return False
-    expert_quant = getattr(model_config, "expert_quant", "none")
-    fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
-    return fmt == "mxfp4" or fmt in _WFMT_IDS
-
-
-def _pin_budget_bytes() -> int | None:
-    """Bytes this process can safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
-
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere."""
-    if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
-        return int(float(env) * 2**30)
-    if not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
-        return None
-    return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
-
-
-def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
-    """Pick CPU (locked) MoE layers automatically when the banks exceed the pin budget.
-
-    Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache."""
-    from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
-
-    bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
-    if not bank_bytes:
-        return frozenset()
-    budget = _pin_budget_bytes()
-    if budget is None or bank_bytes <= budget:
-        return frozenset()
-    if not _cpu_moe_executor_viable(config.model_config):
-        logger.info_rank0(
-            f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB exceed the "
-            f"pin budget {budget / 2**30:.2f} GiB, but the CPU MoE executor cannot "
-            f"serve this model; keeping every layer pinned on the GPU offload path"
-        )
-        return frozenset()
-    n = min(num_moe_layers, math.ceil(num_moe_layers * (1 - budget / bank_bytes)))
-    head = (n + 1) // 2
-    ids = frozenset(range(head)) | frozenset(range(num_moe_layers - (n - head), num_moe_layers))
-    logger.info_rank0(
-        f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
-        f"{budget / 2**30:.2f} GiB; locking {n} head+tail MoE layers for CPU decode "
-        f"({sorted(ids)})"
-    )
-    return ids
-
-
 # MoE-only knobs and the value each resolves to on a dense model. moe_backend is handled
 # separately (its dense value is 'fused', but 'auto' resolves there without a warning).
 _DENSE_MOE_SETTINGS = {
@@ -1247,6 +1524,15 @@ def _adjust_config(config: EngineConfig):
             logger.warning_rank0(
                 f"{getattr(model_config, 'model_type', 'model')} is a dense model (no routed "
                 f"experts); ignoring MoE settings: {', '.join(dropped)}"
+            )
+        # Log dense FFN engine choice
+        if config.dense_ffn_engine == "igpu":
+            logger.info_rank0(
+                f"Dense FFN engine: igpu (B-group FFN offload to iGPU D3D12 service)"
+            )
+        elif config.dense_ffn_engine == "cpu":
+            logger.info_rank0(
+                f"Dense FFN engine: cpu (B-group FFN on CPU)"
             )
 
     if single_stream_only:
@@ -1328,16 +1614,19 @@ def _adjust_config(config: EngineConfig):
     # swigluoai the generic GEMV epilogue). A model with any other expert
     # activation cannot decode on the CPU: reject an explicit cpu/hybrid pick at
     # config time, and keep auto from upgrading offload -> hybrid off the profile.
+    _cpu_moe_acts = (
+        "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
+    )
     # hidden_act (the dense activation) stands proxy for the expert activation --
     # true for every in-tree model. mxfp4 experts pass regardless: their act runs
     # inside the mxfp4 kernel, not the generic epilogue.
-    _cpu_moe_act_ok = getattr(model_config, "hidden_act", "silu") in _CPU_MOE_ACTS or (
+    _cpu_moe_act_ok = getattr(model_config, "hidden_act", "silu") in _cpu_moe_acts or (
         getattr(model_config, "moe_weight_format", None) == "mxfp4"
     )
     if (
         is_moe
         and not _cpu_moe_act_ok
-        and (config.moe_backend in ("cpu", "hybrid") or config.moe_cpu_layers)
+        and (config.moe_backend in ("cpu", "hybrid", "igpu") or config.moe_cpu_layers)
     ):
         asked = (
             f"--moe-cpu-layers={config.moe_cpu_layers!r}"
@@ -1370,8 +1659,8 @@ def _adjust_config(config: EngineConfig):
         bench_fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
         from freetoken.moe.bench_profile import load_backend_recommendation
 
-        gpu_name, gpu_uuid = _profile_gpu()
-        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name, gpu_uuid=gpu_uuid) == "hybrid":
+        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name) == "hybrid":
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")
@@ -1454,6 +1743,21 @@ def _adjust_config(config: EngineConfig):
             f"two-layer prefill buffer (moe_cache_size={2 * num_experts})"
         )
 
+    if is_moe and config.moe_backend == "igpu":
+        # iGPU-compute decode keeps experts in host RAM and computes them on the
+        # iGPU D3D12 service; the GPU only holds the two-layer prefill double
+        # buffer (same shape as the cpu backend).
+        num_experts = config.model_config.num_experts
+        if getattr(config, "moe_cache_auto", False):
+            override("moe_cache_auto", False)
+        override("moe_cache_size", 2 * num_experts)
+        override("moe_prefill_overlap", True)
+        logger.info_rank0(
+            f"MoE backend 'igpu': decode computes experts on the iGPU D3D12 "
+            f"service; GPU keeps a two-layer prefill buffer "
+            f"(moe_cache_size={2 * num_experts})"
+        )
+
     if (
         is_moe
         and expert_quant not in ("none", "fp8_block")
@@ -1464,10 +1768,12 @@ def _adjust_config(config: EngineConfig):
             f"got {config.moe_backend!r}"
         )
 
-    if is_moe and config.moe_cpu_layers and config.moe_backend not in ("offload", "hybrid"):
-        # the layer split needs the offload host banks + slot cache; 'cpu' already runs every layer on CPU, 'fused' keeps experts resident on the GPU (no host banks)
+    if is_moe and config.moe_cpu_layers and config.moe_backend != "offload":
+        # The hybrid split pins a subset of *offload* layers to CPU decode; it needs the
+        # offload host banks + slot cache. 'cpu' already runs every layer on CPU; 'fused'
+        # keeps experts resident on the GPU (no host banks for the CPU executor to read).
         raise ValueError(
-            "--moe-cpu-layers requires --moe-backend offload or hybrid (got "
+            "--moe-cpu-layers requires --moe-backend offload (got "
             f"{config.moe_backend!r}); use --moe-backend cpu to run all layers on CPU"
         )
 

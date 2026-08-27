@@ -84,6 +84,90 @@ def _install_signal_hygiene(setsid: bool) -> None:
             pass
 
 
+def _start_backend_watchdog(manager, interval: float, stop: threading.Event) -> threading.Thread:
+    """The engine's own /health is the single source of truth. When the backend planner
+    dies but uvicorn lingers, health reports status=error while the process looks alive.
+    Restart the generation once (VRAM-settled by ServeManager), else stop the zombie so
+    every client sees the truth instead of a phantom 已加载."""
+    _recover_times: list[float] = []   # 熔断：6 分钟滑动窗内 RECOVER 计数
+    import json as _json
+    import urllib.request as _ur
+
+    def _health_error(port):
+        """None=healthy; otherwise a reason string. Unreachable counts as DOWN
+        (a listening API server never refuses loopback connections)."""
+        try:
+            with _ur.urlopen("http://127.0.0.1:%d/health" % port, timeout=4) as r:
+                doc = _json.loads(r.read().decode("utf-8", "replace"))
+            if isinstance(doc, dict) and doc.get("status") == "error":
+                return str(doc.get("message") or "backend error")
+            return None
+        except Exception as exc:  # noqa: BLE001
+            return "__unreachable__: %s" % exc
+
+    def _run():
+        tried = None
+        import os as _os
+        _dbg = _os.path.join(_os.environ.get("LOCALAPPDATA", ""), "freeToken", "wdg.log")
+        def _dbg_log(msg):
+            try:
+                _os.makedirs(_os.path.dirname(_dbg), exist_ok=True)
+                with open(_dbg, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except Exception:  # noqa: BLE001
+                pass
+        _dbg_log("watchdog armed")
+        ever_healthy = set()          # pids that answered /health at least once
+        while not stop.wait(interval):
+            try:
+                st = manager.status()
+                if not (st.get("running") and not st.get("starting") and not st.get("stopping")):
+                    continue
+                pid = st.get("pid")
+                err = _health_error(st.get("port") or 1919)
+                if err is None:
+                    ever_healthy.add(pid)
+                    _dbg_log("tick ok pid=%s" % pid)
+                    continue
+                # 加载宽限：从未健康过且仅不可达 → 多半在装权重；但收养僵尸
+                # （uptime 已远超正常加载期）不再豁免，避免永久卡死。
+                uptime = int(st.get("uptimeS") or 0)
+                if (err.startswith("__unreachable__") and pid not in ever_healthy
+                        and uptime < 150 and not st.get("adopted")):
+                    continue
+                key = (pid, st.get("model"))
+                if tried == key or (isinstance(tried, tuple) and len(tried) == 3 and tried[1:] == key):
+                    manager.stop()
+                    logger.error("backend still failing (%s); serve stopped", str(err)[:120])
+                    continue
+                logger.warning("backend down (%s); restarting serve once", str(err)[:160])
+                _dbg_log("RECOVER pid=%s reason=%s" % (pid, str(err)[:100]))
+                try:
+                    import time as _tmod
+                    _nowm=_tmod.monotonic(); _recover_times.append(_nowm)
+                    while _recover_times and (_nowm-_recover_times[0])>360: _recover_times.pop(0)
+                    if len(_recover_times)>=3:
+                        try:
+                            from freetoken.daemon.serve_manager import _evt
+                            _evt("circuit OPEN: repeated recover, stopping")
+                        except Exception:
+                            logger.error("circuit OPEN: repeated recover, stopping")
+                        try: manager.stop()
+                        except Exception: pass
+                        return
+                    manager.restart()
+                    tried = key
+                except Exception as ex:
+                    logger.error("restart failed: %s", ex)
+                    manager.stop()
+                    tried = ("gaveup",) + tuple(key or ())
+            except Exception:  # noqa: BLE001
+                pass
+    t = threading.Thread(target=_run, name="ft-daemon-backend-watchdog", daemon=True)
+    t.start()
+    return t
+
+
 def _start_oom_reaper(manager, interval: float, stop: threading.Event) -> threading.Thread:
     """Periodically rewrite the positive OOM score across the whole serve tree so mp-spawn workers
     that fork after the initial write still become the preferred OOM victim."""
@@ -169,6 +253,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
     stop_reaper = threading.Event()
     if not args.no_oom:
         _start_oom_reaper(manager, args.poll_interval, stop_reaper)
+    _start_backend_watchdog(manager, 5.0, stop_reaper)
 
     lifecycle_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ft-daemon-lifecycle")
     proxy_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ft-daemon-proxy")

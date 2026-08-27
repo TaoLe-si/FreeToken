@@ -166,7 +166,14 @@ def is_ft_serve_on_port(pid: int, port: int, *, starttime: int | None = None) ->
     if starttime is not None and read_starttime(pid) != starttime:
         return False
     if not _HAS_PROC:
-        return True
+        # Windows: no /proc cmdline. The recorded serve port MUST accept connections —
+        # a surviving scheduler worker whose API server died is not an ft serve.
+        import socket as _s
+        try:
+            with _s.create_connection(("127.0.0.1", int(port)), timeout=0.6):
+                return True
+        except OSError:
+            return False
     argv = read_cmdline(pid)
     if not argv:
         return False

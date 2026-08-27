@@ -54,6 +54,30 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # iGPU MoE backend (--moe-backend igpu): path to the persistent D3D12 GEMV
+    # service executable (t_d3d12_service.exe). None -> auto-locate (repo build
+    # or FREETOKEN_IGPU_SERVICE).
+    igpu_service: str | None = None
+    # When the iGPU service cannot start (no AMD iGPU / missing exe / self-check
+    # failure): True falls back to --moe-backend cpu for the decode experts,
+    # False raises. Never silently computes on the GPU offload path (the bank
+    # layout would not match the native rows).
+    igpu_fallback: bool = True
+    # Dense-model FFN engine (dense_host_offload architecture, B-group compute):
+    # "cpu" (default) runs FFN GEMVs on the CPU executor from DRAM, "igpu" runs
+    # them on the iGPU D3D12 service, "gpu" keeps everything on the GPU (resident).
+    # Only consulted for dense (non-MoE) models; MoE models ignore it.
+    dense_ffn_engine: str = "cpu"
+    # KV cache placement. "cuda" = VRAM-only with the strict startup budget (current
+    # policy); "shared" = allow the pool to exceed free VRAM -- Windows WDDM places the
+    # overflow in the driver-managed shared pool (dGPU reads it over GTT; this machine's
+    # 8GB card already runs 22GB+ this way) -- boot derives pages from context needs
+    # instead of asserting on a negative budget; "cpu" = host-resident KV (experimental,
+    # requires an attention backend that can read host pages).
+    kv_device: str = "cuda"
+    # compressed-tensors FP8 policy: "native" keeps float8 weights on the W8A16 kernel;
+    # "bf16" dequantizes every FP8 dense weight at load (larger footprint, reference path).
+    ct_fp8: str = "native"
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1

@@ -25,16 +25,37 @@ class SingleInstance:
         self._fd: int | None = None
 
     def acquire(self) -> None:
-        import fcntl  # POSIX-only; the daemon's reference platform is Linux/WSL
-
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.name == "nt":
+                # msvcrt.locking(LK_NBLCK) is the Windows analogue of flock(LOCK_EX|LOCK_NB):
+                # it takes a byte-range lock on the whole file and fails immediately if
+                # another handle already holds it. The lock is released when the fd closes.
+                import msvcrt
+
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, b"\0" * 1)  # need >=1 byte for msvcrt.locking
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                except OSError as exc:
+                    os.close(fd)
+                    raise AlreadyRunning(f"another ft daemon holds {self.path}") from exc
+            else:
+                import fcntl  # POSIX-only; the daemon's reference platform is Linux/WSL
+
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    os.close(fd)
+                    raise AlreadyRunning(f"another ft daemon holds {self.path}") from exc
         except OSError as exc:
             os.close(fd)
             raise AlreadyRunning(f"another ft daemon holds {self.path}") from exc
         os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, f"{os.getpid()}\n".encode())
         os.fsync(fd)
         self._fd = fd

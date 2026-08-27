@@ -124,7 +124,11 @@ def drain_ready(
                 # The worker may have pushed its real failure reason just before exiting; give
                 # the queue a brief window to surface it, else fall back to the generic message.
                 reason = _drain_pending_error(get)
-                raise WorkerDied(reason or f"backend worker {getattr(dead, 'name', '?')} exited during load")
+                raise WorkerDied(
+                    reason
+                    or f"backend worker {getattr(dead, 'name', '?')} exited during load "
+                    f"(pid={getattr(dead, 'pid', '?')}, exitcode={getattr(dead, 'exitcode', '?')})"
+                )
             continue
         err = _as_error(msg)
         if err is not None:

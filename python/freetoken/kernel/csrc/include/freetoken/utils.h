@@ -1,5 +1,9 @@
 #pragma once
 
+// MSVC(nvcc-Windows) 兼容垫片：clang/GCC 风格强制内联关键字
+#if defined(_MSC_VER) && !defined(__always_inline)
+#define __always_inline __forceinline
+#endif
 // ref:
 // https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
 #ifdef __CUDACC__

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -98,18 +99,33 @@ float dot_scalar(const bf16_t* w, const bf16_t* x, int n) {
 // Software prefetch distance (bytes) ahead of the current weight row stream. The
 // weight stream is the bandwidth bottleneck (read once, never reused); nudging the
 // HW prefetcher with a few cache lines of lookahead raises sustained throughput.
-constexpr int PF_AHEAD = 512;
+// Tunable at runtime via FREETOKEN_CPU_MOE_PF_AHEAD (bytes; 0 disables prefetch),
+// because the optimum is hardware-dependent: the microbench measured 128-256 B on
+// Zen 4 while 512 B+ was better on Emerald Rapids-class Intel. Read once per
+// process; the default keeps the historic 512 B.
+static int pf_ahead() {
+  static const int v = [] {
+    const char* s = getenv("FREETOKEN_CPU_MOE_PF_AHEAD");
+    if (s && s[0]) {
+      const int n = std::atoi(s);
+      if (n >= 0 && n <= 65536) return n;
+    }
+    return 512;
+  }();
+  return v;
+}
 
 #if CPU_MOE_X86
 __attribute__((target("avx512f")))
 float dot_avx512f(const bf16_t* w, const bf16_t* x, int n) {
   // 4 independent accumulators -> more in-flight loads (memory-level parallelism),
   // which is what lifts a bandwidth-bound GEMV toward peak.
+  const int pf = pf_ahead();  // hoisted once; env-tunable (FREETOKEN_CPU_MOE_PF_AHEAD)
   __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
   __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
   int i = 0;
   for (; i + 64 <= n; i += 64) {
-    _mm_prefetch(reinterpret_cast<const char*>(w + i) + PF_AHEAD, _MM_HINT_T0);
+    _mm_prefetch(reinterpret_cast<const char*>(w + i) + pf, _MM_HINT_T0);
     for (int j = 0; j < 64; j += 16) {
       __m256i wi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i + j));
       __m256i xi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i + j));
@@ -144,11 +160,12 @@ static inline __m512bh load_bh(const bf16_t* p) {
 __attribute__((target("avx512bf16,avx512f")))
 float dot_avx512bf16(const bf16_t* w, const bf16_t* x, int n) {
   // 4 accumulators (128 bf16/iter) for memory-level parallelism + a prefetch nudge.
+  const int pf = pf_ahead();  // hoisted once; env-tunable (FREETOKEN_CPU_MOE_PF_AHEAD)
   __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
   __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
   int i = 0;
   for (; i + 128 <= n; i += 128) {
-    _mm_prefetch(reinterpret_cast<const char*>(w + i) + PF_AHEAD, _MM_HINT_T0);
+    _mm_prefetch(reinterpret_cast<const char*>(w + i) + pf, _MM_HINT_T0);
     a0 = _mm512_dpbf16_ps(a0, load_bh(w + i), load_bh(x + i));
     a1 = _mm512_dpbf16_ps(a1, load_bh(w + i + 32), load_bh(x + i + 32));
     a2 = _mm512_dpbf16_ps(a2, load_bh(w + i + 64), load_bh(x + i + 64));
@@ -178,11 +195,12 @@ inline float hsum256(__m256 v) {
 
 __attribute__((target("avx2,fma")))
 float dot_avx2(const bf16_t* w, const bf16_t* x, int n) {
+  const int pf = pf_ahead();  // hoisted once; env-tunable (FREETOKEN_CPU_MOE_PF_AHEAD)
   __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
   __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
   int i = 0;
   for (; i + 32 <= n; i += 32) {
-    _mm_prefetch(reinterpret_cast<const char*>(w + i) + PF_AHEAD, _MM_HINT_T0);
+    _mm_prefetch(reinterpret_cast<const char*>(w + i) + pf, _MM_HINT_T0);
     for (int j = 0; j < 32; j += 8) {
       __m128i wi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(w + i + j));
       __m128i xi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + i + j));

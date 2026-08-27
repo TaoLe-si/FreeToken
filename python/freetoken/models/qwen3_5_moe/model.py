@@ -49,7 +49,7 @@ class Qwen3_5DecoderLayer(BaseOP):
             self.self_attn = Qwen3_5Attention(config, layer_id)
         # Dense variants (num_experts==0, e.g. Qwen3.6-27B) use a plain SwiGLU MLP instead of
         # the routed MoE block; both expose ``forward(hidden)->hidden`` and the same key prefix.
-        self.mlp = Qwen3_5MoE(config, layer_id) if config.moe_enabled else Qwen3_5DenseMLP(config)
+        self.mlp = Qwen3_5MoE(config, layer_id) if config.moe_enabled else Qwen3_5DenseMLP(config, layer_id)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -100,6 +100,14 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             self.lm_head = Nvfp4LMHead(
                 num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
             )
+        elif getattr(config, "lm_head_quant", "none") == "fp8_pertensor":
+            # Untied FP8-per-tensor head kept native (W8A16); see config.lm_head_quant.
+            from freetoken.kernel.triton.fp8_pertensor_linear import Fp8LMHead
+
+            assert not config.tie_word_embeddings, "FP8 lm_head assumes untied embeddings"
+            self.lm_head = Fp8LMHead(
+                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size,
+            )
         else:
             self.lm_head = ParallelLMHead(
                 num_embeddings=config.vocab_size,
@@ -113,5 +121,18 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)
 
+    def forward_with_hidden(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward that also returns the post-norm hidden state (before lm_head).
+
+        The hidden state at the last token position is the prev_hidden consumed by
+        the MTP head for the next speculative decode step.
+
+        Returns (logits, prev_hidden) where prev_hidden has the same shape as a single
+        embedding row [1, hidden_size].
+        """
+        output = self.model.forward(get_global_ctx().batch.input_ids)
+        prev_hidden = output[:, -1:, :].detach()
+        logits = self.lm_head.forward(output)
+        return logits, prev_hidden
 
 __all__ = ["Qwen3_5MoEForCausalLM"]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal, Tuple
+from typing import TYPE_CHECKING, Any, List, Literal, Tuple
 
 import torch
 
@@ -176,6 +176,9 @@ class Context:
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None
+    # Dense FFN executor for B-group offload (--dense-ffn-engine igpu/cpu).
+    # When set, DenseMLP.forward() delegates to this executor instead of running on GPU.
+    dense_ffn_executor: Any = None
     _batch: Batch | None = field(default=None, init=False)
 
     @property

@@ -412,7 +412,7 @@ public:
   }
 
   // once we start verification, we cannot modify anymore
-  auto verify(tvm::ffi::TensorView view,
+  auto verify(const tvm::ffi::TensorView &view,
               Loc_t loc = Loc_t::current()) const && -> const TensorMatcher && {
     try {
       this->m_verify_impl(view);

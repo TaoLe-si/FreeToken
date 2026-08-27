@@ -123,7 +123,8 @@ def _leading(t):
 def _rmsnorm(input, weight, eps, out, gemma: bool):
     import torch
 
-    assert weight.ndim == 1 and input.shape[-1] == weight.shape[0]
+    assert weight.ndim == 1 and input.shape[-1] == weight.shape[0], (
+        f"input={tuple(input.shape)} weight={tuple(weight.shape)} dtype={weight.dtype}")
     H = input.shape[-1]
     if input.ndim < 2 or input.ndim > 3:
         # Collapse leading dims (rare: never hit by the shipped models, which pass
@@ -161,7 +162,8 @@ def gemma_rmsnorm(input, weight, eps: float = 1e-6, out=None, enable_pdl: bool =
 
 
 def _fused_add_rmsnorm(input, residual, weight, eps, gemma: bool):
-    assert weight.ndim == 1 and input.shape[-1] == weight.shape[0]
+    assert weight.ndim == 1 and input.shape[-1] == weight.shape[0], (
+        f"input={tuple(input.shape)} weight={tuple(weight.shape)} dtype={weight.dtype}")
     assert input.shape == residual.shape
     H = input.shape[-1]
     assert 2 <= input.ndim <= 3

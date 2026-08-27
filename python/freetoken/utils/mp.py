@@ -95,7 +95,14 @@ class ZmqAsyncPullQueue(Generic[T]):
 
     async def get(self) -> T:
         event = await self.socket.recv()
-        return self.decoder(msgpack.unpackb(event, raw=False))
+        try:
+            return self.decoder(msgpack.unpackb(event, raw=False))
+        except Exception as exc:  # ft-zmq-dbg
+            import logging as _lg
+            _lg.getLogger(__name__).exception(
+                "[ft-zmq-dbg] async decode failed (%s) raw[:80]=%r", exc, event[:80]
+            )
+            raise
 
     def stop(self):
         self.socket.close()

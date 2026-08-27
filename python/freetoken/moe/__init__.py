@@ -26,7 +26,7 @@ SUPPORTED_MOE_BACKENDS = Registry[MoeBackendCreator]("MoE Backend")
 # the CPU, overlapped, then merges (capped PCIe + CPU overflow). All build their
 # cache the same way, so model layer construction and the engine wiring key off
 # this set rather than a bare ``== "offload"`` check.
-OFFLOAD_MOE_BACKENDS = frozenset({"offload", "cpu", "hybrid"})
+OFFLOAD_MOE_BACKENDS = frozenset({"offload", "cpu", "hybrid", "igpu"})
 
 
 def is_offload_moe_backend(backend: str) -> bool:
@@ -59,6 +59,13 @@ def create_hybrid_moe_backend():
     from .cpu_offload import HybridMoeBackend
 
     return HybridMoeBackend()
+
+
+@SUPPORTED_MOE_BACKENDS.register("igpu")
+def create_igpu_moe_backend():
+    from .igpu_offload import IgpuMoeBackend
+
+    return IgpuMoeBackend()
 
 
 def create_moe_backend(backend: str) -> BaseMoeBackend:
