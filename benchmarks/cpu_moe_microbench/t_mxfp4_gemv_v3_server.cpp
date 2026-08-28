@@ -318,7 +318,7 @@ int main() {
         } else if (cmd == "MULTI_GEMV") {
             // MULTI_GEMV B K szPPerItem szSPerItem szAPerItem szBPerItem gblPerItem
             // Body: B items concatenated (each: packed + scales + act + bias + gbl)
-            if (t.size() < 7) { fprintf(stderr, "MULTI_GEMV: bad args\\n"); continue; }
+            if (t.size() < 8) { fprintf(stderr, "MULTI_GEMV: bad args\n"); continue; }
             UINT32 B = std::stoul(t[1]);
             UINT32 K = std::stoul(t[2]);
             UINT32 szPPer = std::stoul(t[3]);
@@ -326,61 +326,61 @@ int main() {
             UINT32 szAPer = std::stoul(t[5]);
             UINT32 szBPer = std::stoul(t[6]);
             UINT32 gblPer = std::stoul(t[7]);
-            if ((K & 31) != 0) { fprintf(stderr, "MULTI_GEMV: K not mult of 32\\n"); continue; }
-            UINT32 nb = K / 8, ns = K / 32;
+            if ((K & 31) != 0) { fprintf(stderr, "MULTI_GEMV: K not mult of 32\n"); continue; }
+            UINT32 nb = K / 8, ns = K / 32;   // nb = packed uints/row; ns = 32-elem blocks/row
             UINT32 szOut = B * 4;
-            UINT64 totalBytes = (UINT64)B * ((UINT64)szPPer + szSPer + szAPer + szBPer + gblPer);
-            std::vector<uint8_t> body(totalBytes);
-            if (!readN(0, body.data(), totalBytes)) { fprintf(stderr, "MULTI_GEMV body read fail\\n"); continue; }
-            // Allocate resources sized for B items (B items each M=1)
+            UINT64 perItem = (UINT64)szPPer + szSPer + szAPer + szBPer + gblPer;
+            UINT64 bodyBytes = (UINT64)B * perItem;
+            UINT64 totalBytes = bodyBytes + (UINT64)B * 4;  // 尾部追加 rowBias 零填充
+            std::vector<uint8_t> body(totalBytes, 0);
+            if (!readN(0, body.data(), bodyBytes)) { fprintf(stderr, "MULTI_GEMV body read fail\n"); continue; }
+            // rowBias 区 (body 之后) 保持全零
             Mxfp4Weight w = createWeight(B, K);
             weights["__multi__"] = w;
             Mxfp4Weight& mw = weights["__multi__"];
-            UINT64 sizeNeeded = totalBytes;
-            if (mw.uploadLoadCap < sizeNeeded) {
-                device->CreateCommittedResource(&hpUp, D3D12_HEAP_FLAG_NONE, &bd(sizeNeeded, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&mw.uploadLoad));
-                mw.uploadLoadCap = sizeNeeded;
+            if (mw.uploadLoadCap < totalBytes) {
+                device->CreateCommittedResource(&hpUp, D3D12_HEAP_FLAG_NONE, &bd(totalBytes, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&mw.uploadLoad));
+                mw.uploadLoadCap = totalBytes;
             }
-            void* m = nullptr; mw.uploadLoad->Map(0, nullptr, &m);
-            std::memcpy(m, body.data(), sizeNeeded);
-            mw.uploadLoad->Unmap(0, nullptr);
-            // Upload
-            UINT64 perItem = (UINT64)szPPer + szSPer + szAPer + szBPer + gblPer;
+            { void* m = nullptr; mw.uploadLoad->Map(0, nullptr, &m);
+              std::memcpy(m, body.data(), (size_t)totalBytes);
+              mw.uploadLoad->Unmap(0, nullptr); }
+            // 上传: 每项数据按行主序展开到 GPU buffer
             uploadList->Reset(uploadAlloc.Get(), nullptr);
             for (UINT32 i = 0; i < B; i++) {
-                UINT64 off = i * perItem;
-                UINT64 dstOff = (UINT64)i * nb * 4;
-                uploadList->CopyBufferRegion(mw.rW.Get(), dstOff, mw.uploadLoad.Get(), off, szPPer);
-                dstOff = (UINT64)i * ns * 4;
-                uploadList->CopyBufferRegion(mw.rS.Get(), dstOff, mw.uploadLoad.Get(), off + szPPer, szSPer);
-                dstOff = (UINT64)i * K * 4;
-                uploadList->CopyBufferRegion(mw.rB.Get(), dstOff, mw.uploadLoad.Get(), off + szPPer + szSPer, szAPer);
-                dstOff = (UINT64)i * 4;
-                uploadList->CopyBufferRegion(mw.rA.Get(), dstOff, mw.uploadLoad.Get(), off + szPPer + szSPer + szAPer, szBPer);
-                uploadList->CopyBufferRegion(mw.rG.Get(), dstOff, mw.uploadLoad.Get(), off + szPPer + szSPer + szAPer + szBPer, gblPer);
+                UINT64 off = (UINT64)i * perItem;
+                uploadList->CopyBufferRegion(mw.rW.Get(), (UINT64)i * nb * 4, mw.uploadLoad.Get(), off, szPPer);                                          // packed
+                uploadList->CopyBufferRegion(mw.rS.Get(), (UINT64)i * ns * 4, mw.uploadLoad.Get(), off + szPPer, szSPer);                                  // scales
+                uploadList->CopyBufferRegion(mw.rB.Get(), (UINT64)i * K * 4, mw.uploadLoad.Get(), off + szPPer + szSPer, szAPer);                          // act
+                uploadList->CopyBufferRegion(mw.rA.Get(), (UINT64)i * ns * 4, mw.uploadLoad.Get(), off + szPPer + szSPer + szAPer, szBPer);                // bias(每块)
+                uploadList->CopyBufferRegion(mw.rG.Get(), (UINT64)i * 4,     mw.uploadLoad.Get(), off + szPPer + szSPer + szAPer + szBPer, gblPer);       // gbl
+                uploadList->CopyBufferRegion(mw.rR.Get(), (UINT64)i * 4,     mw.uploadLoad.Get(), bodyBytes + (UINT64)i * 4, 4);                          // rowBias=0
             }
-            { D3D12_RESOURCE_BARRIER bs[5] = {};
-              bs[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bs[0].Transition.pResource = mw.rW.Get(); bs[0].Transition.Subresource = 0; bs[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; bs[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-              bs[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bs[1].Transition.pResource = mw.rS.Get(); bs[1].Transition.Subresource = 0; bs[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; bs[1].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-              bs[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bs[2].Transition.pResource = mw.rB.Get(); bs[2].Transition.Subresource = 0; bs[2].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; bs[2].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-              bs[3].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bs[3].Transition.pResource = mw.rA.Get(); bs[3].Transition.Subresource = 0; bs[3].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; bs[3].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-              bs[4].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bs[4].Transition.pResource = mw.rG.Get(); bs[4].Transition.Subresource = 0; bs[4].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; bs[4].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-              uploadList->ResourceBarrier(5, bs); }
+            { D3D12_RESOURCE_BARRIER bs[6] = {}; int nbb = 0;
+              auto addSRV = [&](ID3D12Resource* r) {
+                bs[nbb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bs[nbb].Transition.pResource = r;
+                bs[nbb].Transition.Subresource = 0; bs[nbb].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                bs[nbb].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; ++nbb; };
+              addSRV(mw.rW.Get()); addSRV(mw.rS.Get()); addSRV(mw.rB.Get());
+              addSRV(mw.rA.Get()); addSRV(mw.rG.Get()); addSRV(mw.rR.Get());
+              uploadList->ResourceBarrier(nbb, bs); }
             if (!submit(uploadList, "MULTI_GEMV-up")) continue;
-            mw.rWSt = mw.rSSt = mw.rBSt = mw.rASt = mw.rGSt = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            mw.rWSt = mw.rSSt = mw.rBSt = mw.rASt = mw.rGSt = mw.rRSt = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             void* cm = nullptr; mw.rCb->Map(0, nullptr, &cm);
-            struct { uint32_t K, nbPerRow, nsPerRow, pad; } cbv = { K, ns, ns, 0 };  // 同STATELESS: nbPerRow=块数(K/32)
+            struct { uint32_t K, nbPerRow, nsPerRow, pad; } cbv = { K, ns, ns, 0 };  // nbPerRow=块数(K/32)
             std::memcpy(cm, &cbv, sizeof(cbv));
             mw.rCb->Unmap(0, nullptr);
+            // 绑定 (与 STATELESS 相同的 8 槽布局)
             dispatchList->Reset(dispatchAlloc.Get(), pso.Get());
             dispatchList->SetComputeRootSignature(rs.Get());
-            dispatchList->SetComputeRootShaderResourceView(0, mw.rW->GetGPUVirtualAddress());
-            dispatchList->SetComputeRootShaderResourceView(1, mw.rS->GetGPUVirtualAddress());
-            dispatchList->SetComputeRootShaderResourceView(2, mw.rB->GetGPUVirtualAddress());
-            dispatchList->SetComputeRootShaderResourceView(3, mw.rA->GetGPUVirtualAddress());
-            dispatchList->SetComputeRootShaderResourceView(4, mw.rG->GetGPUVirtualAddress());
-            dispatchList->SetComputeRootUnorderedAccessView(5, mw.rOut->GetGPUVirtualAddress());
-            dispatchList->SetComputeRootConstantBufferView(6, mw.rCb->GetGPUVirtualAddress());
+            dispatchList->SetComputeRootShaderResourceView(0, mw.rW->GetGPUVirtualAddress());  // t0 packed
+            dispatchList->SetComputeRootShaderResourceView(1, mw.rS->GetGPUVirtualAddress());  // t1 scl
+            dispatchList->SetComputeRootShaderResourceView(2, mw.rA->GetGPUVirtualAddress());  // t2 bias(每块)
+            dispatchList->SetComputeRootShaderResourceView(3, mw.rB->GetGPUVirtualAddress());  // t3 act
+            dispatchList->SetComputeRootShaderResourceView(4, mw.rG->GetGPUVirtualAddress());  // t4 gbl
+            dispatchList->SetComputeRootShaderResourceView(5, mw.rR->GetGPUVirtualAddress());  // t5 rowBias
+            dispatchList->SetComputeRootUnorderedAccessView(6, mw.rOut->GetGPUVirtualAddress()); // u0 outv
+            dispatchList->SetComputeRootConstantBufferView(7, mw.rCb->GetGPUVirtualAddress());  // b0 cbuffer
             if (mw.rOutSt != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
                 D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = mw.rOut.Get(); b.Transition.Subresource = 0; b.Transition.StateBefore = mw.rOutSt; b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
                 dispatchList->ResourceBarrier(1, &b);
@@ -396,8 +396,8 @@ int main() {
             writeAll(1, &szOut, 4);
             writeAll(1, om, szOut);
             mw.rRb->Unmap(0, nullptr);
-            fprintf(stderr, "  MULTI_GEMV B=%u done\\n", B); fflush(stderr);
-        } else {
+            fprintf(stderr, "  MULTI_GEMV B=%u done\n", B); fflush(stderr);
+                } else {
             fprintf(stderr, "unknown cmd: %s\\n", cmd.c_str());
         }
     }
