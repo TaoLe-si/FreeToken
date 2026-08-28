@@ -130,6 +130,20 @@ int main() {
     device->CreateComputePipelineState(&psd, IID_PPV_ARGS(&pso));
     fprintf(stderr, "pso ok\n"); fflush(stderr);
 
+    // FC broadcast shader (act shared across rows) for sticky FC_LOAD/FC_CALL
+    ComPtr<ID3D12PipelineState> psoFc;
+    {
+        std::ifstream fi2("t_nvfp4_gemv_fcbcast.dxil", std::ios::binary);
+        std::vector<uint8_t> dxil2((std::istreambuf_iterator<char>(fi2)), std::istreambuf_iterator<char>());
+        if (dxil2.empty()) { fprintf(stderr, "missing t_nvfp4_gemv_fcbcast.dxil\n"); return 1; }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psd2 = {};
+        psd2.pRootSignature = rs.Get();
+        psd2.CS = { dxil2.data(), dxil2.size() };
+        HRESULT hr = device->CreateComputePipelineState(&psd2, IID_PPV_ARGS(&psoFc));
+        if (FAILED(hr)) { fprintf(stderr, "psoFc failed hr=0x%08X\n", hr); return 1; }
+        fprintf(stderr, "psoFc ok\n"); fflush(stderr);
+    }
+
     D3D12_HEAP_PROPERTIES hpDef = { D3D12_HEAP_TYPE_DEFAULT };
     D3D12_HEAP_PROPERTIES hpUp = { D3D12_HEAP_TYPE_UPLOAD };
     D3D12_HEAP_PROPERTIES hpRb = { D3D12_HEAP_TYPE_READBACK };
@@ -165,6 +179,22 @@ int main() {
     };
 
     std::unordered_map<std::string, Mxfp4Weight> weights;
+
+    // ---- Sticky FC resources (FC_LOAD / FC_CALL) ----
+    struct FcState {
+        UINT64 M = 0; UINT32 K = 0; UINT32 nb = 0; UINT32 ns = 0;
+        bool loaded = false;
+        ComPtr<ID3D12Resource> rW, rS, rA, rAct, rG, rR, rOut, rRb, rCb, upLoad, upCall;
+        D3D12_RESOURCE_STATES rWSt = D3D12_RESOURCE_STATE_COPY_DEST;
+        D3D12_RESOURCE_STATES rSSt = D3D12_RESOURCE_STATE_COPY_DEST;
+        D3D12_RESOURCE_STATES rASt = D3D12_RESOURCE_STATE_COPY_DEST;
+        D3D12_RESOURCE_STATES rActSt = D3D12_RESOURCE_STATE_COPY_DEST;
+        D3D12_RESOURCE_STATES rGSt = D3D12_RESOURCE_STATE_COPY_DEST;
+        D3D12_RESOURCE_STATES rRSt = D3D12_RESOURCE_STATE_COPY_DEST;
+        D3D12_RESOURCE_STATES rOutSt = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        UINT64 upLoadCap = 0, upCallCap = 0;
+        void release() { rW.Reset(); rS.Reset(); rA.Reset(); rAct.Reset(); rG.Reset(); rR.Reset(); rOut.Reset(); rRb.Reset(); rCb.Reset(); upLoad.Reset(); upCall.Reset(); loaded = false; M = 0; K = 0; upLoadCap = 0; upCallCap = 0; }
+    } fc;
     fprintf(stderr, "mxfp4-v3 server ready\n"); fflush(stderr);
 
     while (true) {
@@ -183,6 +213,7 @@ int main() {
         if (t.empty()) continue;
         std::string cmd = t[0];
 
+        try {
         if (cmd == "QUIT") { fprintf(stderr, "QUIT\n"); break; }
         else if (cmd == "STATELESS") {
             if (t.size() < 7) { fprintf(stderr, "STATELESS: bad args\n"); continue; }
@@ -397,9 +428,132 @@ int main() {
             writeAll(1, om, szOut);
             mw.rRb->Unmap(0, nullptr);
             fprintf(stderr, "  MULTI_GEMV B=%u done\n", B); fflush(stderr);
-                } else {
-            fprintf(stderr, "unknown cmd: %s\\n", cmd.c_str());
+                } else if (cmd == "FC_LOAD") {
+            // FC_LOAD <M> <K> <szP> <szS> <szB>  body: packed(M*nb*4) | scales(M*ns*4) | biases(M*ns*4)
+            if (t.size() < 6) { fprintf(stderr, "FC_LOAD: bad args\n"); continue; }
+            UINT32 M = std::stoul(t[1]);
+            UINT32 K = std::stoul(t[2]);
+            UINT32 szP = std::stoul(t[3]);
+            UINT32 szS = std::stoul(t[4]);
+            UINT32 szB = std::stoul(t[5]);
+            if ((K & 31) != 0) { fprintf(stderr, "FC_LOAD: K not mult of 32\n"); continue; }
+            UINT32 nb = K / 8, ns = K / 32;
+            if ((UINT64)szP != (UINT64)M * nb * 4 || (UINT64)szS != (UINT64)M * ns * 4 || (UINT64)szB != (UINT64)M * ns * 4) {
+                fprintf(stderr, "FC_LOAD: size mismatch\n"); continue;
+            }
+            std::vector<uint8_t> body((size_t)szP + szS + szB);
+            if (!readN(0, body.data(), body.size())) { fprintf(stderr, "FC_LOAD: body read fail\n"); continue; }
+            fc.release();
+            fc.M = M; fc.K = K; fc.nb = nb; fc.ns = ns;
+            UINT64 szW = (UINT64)M * nb * 4, szSc = (UINT64)M * ns * 4, szBi = (UINT64)M * ns * 4;
+            UINT64 szAct = (UINT64)K * 4, szGr = (UINT64)M * 4, szOut = (UINT64)M * 4;
+            device->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE, &bd(szW, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fc.rW));
+            device->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE, &bd(szSc, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fc.rS));
+            device->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE, &bd(szBi, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fc.rA));
+            device->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE, &bd(szAct, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fc.rAct));
+            device->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE, &bd(szGr, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fc.rG));
+            device->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE, &bd(szGr, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fc.rR));
+            device->CreateCommittedResource(&hpDef, D3D12_HEAP_FLAG_NONE, &bd(szOut, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&fc.rOut));
+            device->CreateCommittedResource(&hpRb, D3D12_HEAP_FLAG_NONE, &bd(szOut, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&fc.rRb));
+            device->CreateCommittedResource(&hpUp, D3D12_HEAP_FLAG_NONE, &bd(256, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&fc.rCb));
+            UINT64 total = szW + szSc + szBi + szGr * 2;
+            device->CreateCommittedResource(&hpUp, D3D12_HEAP_FLAG_NONE, &bd(total, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&fc.upLoad));
+            fc.upLoadCap = total;
+            { void* m = nullptr; fc.upLoad->Map(0, nullptr, &m);
+              std::memcpy(m, body.data(), (size_t)(szW + szSc + szBi));
+              float* g = (float*)((char*)m + szW + szSc + szBi);
+              for (UINT32 i = 0; i < M; i++) g[i] = 1.0f;
+              float* rb = g + M;
+              for (UINT32 i = 0; i < M; i++) rb[i] = 0.0f;
+              fc.upLoad->Unmap(0, nullptr); }
+            { void* cm = nullptr; fc.rCb->Map(0, nullptr, &cm);
+              struct { uint32_t K, nbPerRow, nsPerRow, pad; } cbv = { K, ns, ns, 0 };
+              std::memcpy(cm, &cbv, sizeof(cbv));
+              fc.rCb->Unmap(0, nullptr); }
+            uploadList->Reset(uploadAlloc.Get(), nullptr);
+            uploadList->CopyBufferRegion(fc.rW.Get(), 0, fc.upLoad.Get(), 0, szW);
+            uploadList->CopyBufferRegion(fc.rS.Get(), 0, fc.upLoad.Get(), szW, szSc);
+            uploadList->CopyBufferRegion(fc.rA.Get(), 0, fc.upLoad.Get(), szW + szSc, szBi);
+            uploadList->CopyBufferRegion(fc.rG.Get(), 0, fc.upLoad.Get(), szW + szSc + szBi, szGr);
+            uploadList->CopyBufferRegion(fc.rR.Get(), 0, fc.upLoad.Get(), szW + szSc + szBi + szGr, szGr);
+            { D3D12_RESOURCE_BARRIER bs[5] = {};
+              for (int i = 0; i < 5; i++) { bs[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bs[i].Transition.Subresource = 0;
+                bs[i].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; bs[i].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; }
+              bs[0].Transition.pResource = fc.rW.Get(); bs[1].Transition.pResource = fc.rS.Get(); bs[2].Transition.pResource = fc.rA.Get();
+              bs[3].Transition.pResource = fc.rG.Get(); bs[4].Transition.pResource = fc.rR.Get();
+              uploadList->ResourceBarrier(5, bs); }
+            if (!submit(uploadList, "FC_LOAD")) { fc.release(); continue; }
+            fc.rWSt = fc.rSSt = fc.rASt = fc.rGSt = fc.rRSt = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            fc.rActSt = D3D12_RESOURCE_STATE_COPY_DEST;
+            fc.loaded = true;
+            const char ok[] = "OK\n";
+            writeAll(1, ok, 3);
+            fprintf(stderr, "FC_LOAD M=%u K=%u done (%.1f MB)\n", M, K, (double)total / 1048576.0); fflush(stderr);
+        } else if (cmd == "FC_CALL") {
+            // FC_CALL <szA>  body: act (K*4 float32, shared across rows)
+            if (t.size() < 2) { fprintf(stderr, "FC_CALL: bad args (need szA)\n"); continue; }
+            if (!fc.loaded) { fprintf(stderr, "FC_CALL: no FC loaded\n"); continue; }
+            UINT32 szA = std::stoul(t[1]);
+            if ((UINT64)szA != (UINT64)fc.K * 4) { fprintf(stderr, "FC_CALL: szA=%u want %llu\n", szA, (unsigned long long)fc.K * 4); continue; }
+            std::vector<uint8_t> actb(szA);
+            if (!readN(0, actb.data(), szA)) { fprintf(stderr, "FC_CALL: act read fail\n"); continue; }
+            if (!fc.upCall || fc.upCallCap < szA) {
+                fc.upCall.Reset();
+                device->CreateCommittedResource(&hpUp, D3D12_HEAP_FLAG_NONE, &bd(szA, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&fc.upCall));
+                fc.upCallCap = szA;
+            }
+            { void* m = nullptr; fc.upCall->Map(0, nullptr, &m);
+              std::memcpy(m, actb.data(), szA);
+              fc.upCall->Unmap(0, nullptr); }
+            uploadList->Reset(uploadAlloc.Get(), nullptr);
+            if (fc.rActSt != D3D12_RESOURCE_STATE_COPY_DEST) {
+                D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = fc.rAct.Get(); b.Transition.Subresource = 0;
+                b.Transition.StateBefore = fc.rActSt; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                uploadList->ResourceBarrier(1, &b);
+            }
+            uploadList->CopyBufferRegion(fc.rAct.Get(), 0, fc.upCall.Get(), 0, szA);
+            { D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+              b.Transition.pResource = fc.rAct.Get(); b.Transition.Subresource = 0;
+              b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+              uploadList->ResourceBarrier(1, &b); }
+            if (!submit(uploadList, "FC_CALL-up")) continue;
+            fc.rActSt = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            dispatchList->Reset(dispatchAlloc.Get(), psoFc.Get());
+            dispatchList->SetComputeRootSignature(rs.Get());
+            dispatchList->SetComputeRootShaderResourceView(0, fc.rW->GetGPUVirtualAddress());    // t0 packed
+            dispatchList->SetComputeRootShaderResourceView(1, fc.rS->GetGPUVirtualAddress());    // t1 scales
+            dispatchList->SetComputeRootShaderResourceView(2, fc.rA->GetGPUVirtualAddress());    // t2 bias
+            dispatchList->SetComputeRootShaderResourceView(3, fc.rAct->GetGPUVirtualAddress());  // t3 act(shared)
+            dispatchList->SetComputeRootShaderResourceView(4, fc.rG->GetGPUVirtualAddress());    // t4 gbl
+            dispatchList->SetComputeRootShaderResourceView(5, fc.rR->GetGPUVirtualAddress());    // t5 rowBias
+            dispatchList->SetComputeRootUnorderedAccessView(6, fc.rOut->GetGPUVirtualAddress()); // u0 outv
+            dispatchList->SetComputeRootConstantBufferView(7, fc.rCb->GetGPUVirtualAddress());  // b0 cbuffer
+            if (fc.rOutSt != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+                D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = fc.rOut.Get(); b.Transition.Subresource = 0;
+                b.Transition.StateBefore = fc.rOutSt; b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                dispatchList->ResourceBarrier(1, &b);
+                fc.rOutSt = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            }
+            dispatchList->Dispatch((UINT)fc.M, 1, 1);
+            { D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+              b.Transition.pResource = fc.rOut.Get(); b.Transition.Subresource = 0;
+              b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+              dispatchList->ResourceBarrier(1, &b);
+              fc.rOutSt = D3D12_RESOURCE_STATE_COPY_SOURCE; }
+            dispatchList->CopyResource(fc.rRb.Get(), fc.rOut.Get());
+            if (!submit(dispatchList, "FC_CALL-dispatch")) continue;
+            UINT32 szOut = (UINT32)(fc.M * 4);
+            void* om = nullptr; fc.rRb->Map(0, nullptr, &om);
+            writeAll(1, &szOut, 4);
+            writeAll(1, om, szOut);
+            fc.rRb->Unmap(0, nullptr);
+        } else {
+            fprintf(stderr, "unknown cmd: %s\n", cmd.c_str());
         }
+        } catch (const std::exception& e) { fprintf(stderr, "cmd error: %s\n", e.what()); fflush(stderr); }
+
     }
     return 0;
 }

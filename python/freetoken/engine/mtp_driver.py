@@ -12,7 +12,7 @@ import numpy as np
 from typing import Optional
 
 from freetoken.models.qwen3_5_moe.mtp import MtpHeadConfig, load_mtp_head_from_safetensors
-from freetoken.kernel.igpu_fc import IgpuFcClient, IgpuFcSticky
+from freetoken.kernel.igpu_fc import IgpuFcSticky
 
 
 class MtpDriver:
@@ -59,46 +59,45 @@ class MtpDriver:
             model_path, mtp_cfg, embed, lm_head, igpu_fc=None, device=self.device, dtype=torch.bfloat16,
         )
         self.head.eval()
-        # iGPU FC client
-        self._igpu_client = None
+        # iGPU FC (sticky: full (M, K//8) weight matrix uploaded once via FC_LOAD)
+        self._igpu_sticky = None
         if use_igpu_fc:
             try:
-                self._igpu_client = IgpuFcClient()
-                if self.head._packed_mxfp4["fc.weight"] is not None:
-                    fc_packed = self.head._packed_mxfp4["fc.weight"][0:1].cpu().numpy().astype("uint32")
-                    # NVFP4 scales (fc.scales): stored as float32 already in safetensors?
-                    # Check dtype — model stores as float32 (NVFP4 fp16 stored as float32 for GPU)
-                    fc_scales_t = self.head._packed_mxfp4["fc.scales"]
-                    fc_biases_t = self.head._packed_mxfp4["fc.biases"]
-                    if fc_scales_t is not None:
-                        # fc.scales shape: (M, ns) -- M=1, ns=K//32=128
-                        fc_scales = fc_scales_t[0:1].cpu().numpy().astype("float32")
-                    else:
-                        fc_scales = None
-                    if fc_biases_t is not None:
-                        fc_biases = fc_biases_t[0:1].cpu().numpy().astype("float32")
-                    else:
-                        fc_biases = None
-                    sticky = IgpuFcSticky(self._igpu_client, fc_packed, 4096,
+                fc_packed_t = self.head._packed_mxfp4.get("fc.weight")
+                if fc_packed_t is not None:
+                    fc_packed = fc_packed_t.cpu().numpy().astype("uint32")  # (M, K//8)
+                    M_fc, nb_fc = fc_packed.shape
+                    K_fc = nb_fc * 8
+                    ns_fc = K_fc // 32
+                    fc_scales_t = self.head._packed_mxfp4.get("fc.scales")
+                    fc_biases_t = self.head._packed_mxfp4.get("fc.biases")
+                    fc_scales = (fc_scales_t.cpu().numpy().astype("float32")
+                                 if fc_scales_t is not None
+                                 else np.zeros((M_fc, ns_fc), dtype="float32"))
+                    fc_biases = (fc_biases_t.cpu().numpy().astype("float32")
+                                 if fc_biases_t is not None
+                                 else np.zeros((M_fc, ns_fc), dtype="float32"))
+                    sticky = IgpuFcSticky(fc_packed, K_fc,
                                           scales_f32=fc_scales, biases_f32=fc_biases)
-                    self.head.igpu_fc = self._make_adapter(sticky)
-            except FileNotFoundError:
-                self._igpu_client = None
+                    self._igpu_sticky = sticky
+                    self.head.igpu_fc = sticky.torch()  # device-adaptive bridge
+            except (FileNotFoundError, RuntimeError):
+                # iGPU server unavailable — fall back to non-igpu path
+                self._igpu_sticky = None
         self.cfg = mtp_cfg
 
-    @staticmethod
-    def _make_adapter(sticky):
-        class _A:
-            def __init__(self, s): self.s = s
-            def __call__(self, act_flat):
-                if act_flat.requires_grad:
-                    act_flat = act_flat.detach()
-                if act_flat.dtype == torch.bfloat16:
-                    act_flat = act_flat.to(torch.float32)
-                act_np = act_flat.cpu().numpy().astype("float32")
-                outv = self.s(act_np)
-                return torch.from_numpy(outv.copy()).to("cuda").to(torch.bfloat16)
-        return _A(sticky)
+    def close(self):
+        """Shut down the iGPU FC sticky server process."""
+        if self._igpu_sticky is not None:
+            self._igpu_sticky.close()
+            self._igpu_sticky = None
+            self.head.igpu_fc = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @torch.inference_mode()
     def draft(self, prev_token_id: int, prev_hidden: torch.Tensor) -> tuple[list[int], list[torch.Tensor]]:
@@ -194,6 +193,6 @@ class MtpDriver:
         return n_accept
 
     def warmup(self):
-        if self._igpu_client is not None:
-            act = np.random.randn(4096).astype("float32")
+        if self._igpu_sticky is not None:
+            act = torch.zeros(self._igpu_sticky.K, dtype=torch.float32)
             self.head.igpu_fc(act)

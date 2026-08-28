@@ -63,13 +63,21 @@ class IgpuFcClient:
             sys.stderr.write("[SERVER] " + text)
             sys.stderr.flush()
 
-    def __del__(self):
+    def close(self):
+        """Graceful shutdown: send QUIT, then kill if needed."""
         try:
-            if self.proc is not None and self.proc.poll() is None:
-                self.proc.terminate()
-                self.proc.wait(timeout=2)
+            if getattr(self, 'proc', None) is not None and self.proc.poll() is None:
+                self.proc.stdin.write(b"QUIT\n")
+                self.proc.stdin.flush()
+                try:
+                    self.proc.wait(timeout=2)
+                except Exception:
+                    self.proc.kill()
         except Exception:
             pass
+
+    def __del__(self):
+        self.close()
 
     def forward(self, packed_u32, act_int32, scales_f32=None, biases_f32=None):
         """Run one GEMV on the iGPU. Returns outv float32 [M].
@@ -126,43 +134,177 @@ class IgpuFcClient:
         return out
 
 class IgpuFcSticky:
-    """Sticky-weight FC: pre-load packed weight + scales + biases, then __call__ takes just activations.
-    Matches MTP head's igpu_fc(cat_flat) contract.
+    """Sticky-weight FC via v3 server FC_LOAD/FC_CALL protocol.
 
-    Args:
-        client: IgpuFcClient
-        packed_u32: (1, K//8) uint32 e2m1 nibble-packed weights
-        K: hidden size
-        scales_f32: (1, K//32) float32 NVFP4 fp16 scale (per-block)
-        biases_f32: (1, K//32) float32 NVFP4 per-block bias
+    Weights (packed + scales + biases) are uploaded ONCE at construction; each
+    __call__ transfers only the shared activation vector (K*4 bytes) and gets
+    back M float32 outputs.
+
+    Supports full (M, K//8) weight matrices (e.g. MTP fc: 2048 x 4096) — the
+    GPU kernel is the fcbcast variant: one shared act, M output rows.
+
+    .torch() returns a torch-callable bridge (cuda/cpu in, same-device out)
+    matching the MTP head's igpu_fc contract.
     """
-    def __init__(self, client, packed_u32, K, scales_f32=None, biases_f32=None):
+
+    def __init__(self, packed_u32, K, scales_f32=None, biases_f32=None,
+                 server_path=None, client=None):
+        if server_path is None:
+            cand = os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                                "benchmarks", "cpu_moe_microbench", "t_mxfp4_gemv_v3_server.exe")
+            server_path = os.path.abspath(cand)
+        if not os.path.exists(server_path):
+            raise FileNotFoundError(f"iGPU v3 server not found: {server_path}")
+
         assert packed_u32.dtype == np.uint32
         assert K % 32 == 0
-        assert packed_u32.shape == (1, K // 8), f"got {packed_u32.shape}, expected (1, {K//8})"
+        M = packed_u32.shape[0]
+        assert packed_u32.shape == (M, K // 8), f"got {packed_u32.shape}, expected ({M}, {K//8})"
         ns = K // 32
         if scales_f32 is None:
-            scales_f32 = np.zeros((1, ns), dtype=np.float32)
+            scales_f32 = np.zeros((M, ns), dtype=np.float32)
         if biases_f32 is None:
-            biases_f32 = np.zeros((1, ns), dtype=np.float32)
-        assert scales_f32.shape == (1, ns), f"scales_f32 shape {scales_f32.shape} != (1, {ns})"
-        assert biases_f32.shape == (1, ns), f"biases_f32 shape {biases_f32.shape} != (1, {ns})"
-        self.client = client
-        self.packed_u32 = packed_u32.copy()
-        self.scales_f32 = scales_f32.copy()
-        self.biases_f32 = biases_f32.copy()
-        self.K = K
+            biases_f32 = np.zeros((M, ns), dtype=np.float32)
+        scales_f32 = np.ascontiguousarray(scales_f32, dtype=np.float32)
+        biases_f32 = np.ascontiguousarray(biases_f32, dtype=np.float32)
+        assert scales_f32.shape == (M, ns), f"scales_f32 shape {scales_f32.shape} != ({M}, {ns})"
+        assert biases_f32.shape == (M, ns), f"biases_f32 shape {biases_f32.shape} != ({M}, {ns})"
 
+        self.M = M
+        self.K = K
+        self.packed_u32 = np.ascontiguousarray(packed_u32)
+        self.scales_f32 = scales_f32
+        self.biases_f32 = biases_f32
+        self.server_path = server_path
+        self.server_cwd = os.path.dirname(server_path)
+        self.stderr_lines = []
+        self._lock = threading.Lock()
+        self._open()
+
+        # Upload weights once (FC_LOAD)
+        szP, szS, szB = M * (K // 8) * 4, M * ns * 4, M * ns * 4
+        cmd = f"FC_LOAD {M} {K} {szP} {szS} {szB}\n".encode()
+        body = (self.packed_u32.tobytes() + self.scales_f32.tobytes()
+                + self.biases_f32.tobytes())
+        with self._lock:
+            self.proc.stdin.write(cmd)
+            self.proc.stdin.write(body)
+            self.proc.stdin.flush()
+            ack = self._read_exact(3)
+            if ack != b"OK\n":
+                raise RuntimeError(f"FC_LOAD failed: {ack!r} log={self.get_log(10)}")
+
+    # ---- process management ----
+    def _open(self):
+        self.proc = subprocess.Popen(
+            [self.server_path],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=0, cwd=self.server_cwd,
+        )
+        threading.Thread(target=self._drain, daemon=True).start()
+        t0 = time.time()
+        while time.time() - t0 < 15.0:
+            log = " ".join(self.stderr_lines[-8:])
+            if "psoFc ok" in log or "server ready" in log:
+                return
+            time.sleep(0.05)
+
+    def _drain(self):
+        while True:
+            try:
+                l = self.proc.stderr.readline()
+            except Exception:
+                return
+            if not l:
+                return
+            self.stderr_lines.append(l.decode(errors="replace").rstrip())
+
+    def _read_exact(self, n):
+        out = b''
+        while len(out) < n:
+            chunk = self.proc.stdout.read(n - len(out))
+            if not chunk:
+                raise RuntimeError(
+                    f"iGPU server died (read {len(out)}/{n}). "
+                    f"Log tail: {self.get_log(10)}")
+            out += chunk
+        return out
+
+    def close(self):
+        try:
+            if self.proc is not None and self.proc.poll() is None:
+                self.proc.stdin.write(b"QUIT\n")
+                self.proc.stdin.flush()
+                try:
+                    self.proc.wait(timeout=2)
+                except Exception:
+                    self.proc.kill()
+        except Exception:
+            pass
+
+    def __del__(self):
+        self.close()
+
+    # ---- core call ----
     def __call__(self, act_flat):
+        """act_flat: (K,) float32 numpy -> (M,) float32 numpy."""
         assert act_flat.dtype == np.float32
         assert act_flat.shape == (self.K,), f"act shape {act_flat.shape} != ({self.K},)"
-        act_int = act_flat.view(np.int32)
-        outv = self.client.forward(self.packed_u32, act_int, self.scales_f32, self.biases_f32)
-        return outv
+        act_c = np.ascontiguousarray(act_flat, dtype=np.float32)
+        with self._lock:
+            self.proc.stdin.write(f"FC_CALL {self.K * 4}\n".encode())
+            self.proc.stdin.write(act_c.tobytes())
+            self.proc.stdin.flush()
+            rl = self._read_exact(4)
+            sz = struct.unpack('<I', rl)[0]
+            outv = self._read_exact(sz)
+        return np.frombuffer(outv, dtype=np.float32).copy()
 
-    def update_weight(self, packed_u32):
+    # ---- torch bridge ----
+    def torch(self):
+        """Return a torch-callable wrapper (cuda/cpu in, same-device out)."""
+        import torch
+        sticky = self
+
+        class _TorchFc:
+            def __call__(self_, x):
+                if x.dim() == 2 and x.shape[0] == 1:
+                    x = x.squeeze(0)
+                assert x.dim() == 1 and x.shape[0] == sticky.K
+                dev = x.device
+                x32 = x.detach().to(torch.float32).cpu().numpy()
+                out = sticky(x32)
+                t = torch.from_numpy(out)
+                return t.to(dev).to(x.dtype).unsqueeze(0)  # (1, M)
+
+            def close(self_):
+                sticky.close()
+
+        return _TorchFc()
+
+    # ---- legacy compat ----
+    def update_weight(self, packed_u32, scales_f32=None, biases_f32=None):
+        """Replace weights in-place (re-runs FC_LOAD)."""
+        assert packed_u32.dtype == np.uint32
         assert packed_u32.shape == self.packed_u32.shape
-        self.packed_u32 = packed_u32.copy()
+        self.packed_u32 = np.ascontiguousarray(packed_u32)
+        if scales_f32 is not None: self.scales_f32 = np.ascontiguousarray(scales_f32, dtype=np.float32)
+        if biases_f32 is not None: self.biases_f32 = np.ascontiguousarray(biases_f32, dtype=np.float32)
+        M, K, ns = self.M, self.K, self.K // 32
+        szP, szS, szB = M * (K // 8) * 4, M * ns * 4, M * ns * 4
+        cmd = f"FC_LOAD {M} {K} {szP} {szS} {szB}\n".encode()
+        body = (self.packed_u32.tobytes() + self.scales_f32.tobytes()
+                + self.biases_f32.tobytes())
+        with self._lock:
+            self.proc.stdin.write(cmd)
+            self.proc.stdin.write(body)
+            self.proc.stdin.flush()
+            ack = self._read_exact(3)
+            if ack != b"OK\n":
+                raise RuntimeError(f"FC_LOAD (update) failed: {ack!r}")
+
+    def get_log(self, last_n=20):
+        return self.stderr_lines[-last_n:]
 
 
 

@@ -54,7 +54,7 @@ nb = K // 8
 ns = K // 32
 packed = np.zeros((M, nb), dtype=np.uint32)
 scl = np.zeros((M, ns), dtype=np.float32)  # NVFP4 fp16 scale (as float32)
-act = np.zeros(K, dtype=np.int32)
+act = np.zeros(K, dtype=np.float32).view(np.int32)
 bias_pb = np.zeros((M, ns), dtype=np.float32)  # per-block bias
 
 # T1: zero everything, bias=0
@@ -94,7 +94,7 @@ ns = K // 32
 packed = np.zeros((M, nb), dtype=np.uint32)
 packed[:] = 0x11111111
 scl = np.ones((M, ns), dtype=np.float32)
-act = np.ones(K, dtype=np.int32)
+act = np.ones(K, dtype=np.float32).view(np.int32)
 bias_pb = np.zeros((M, ns), dtype=np.float32)
 outv = call_one(M, K, packed, scl, act, bias_pb, "T6-m4")
 print("T6 M=4 K=32 packed=1 scale=1 act=1 bias=0: outv=%s (expect [32, 32, 32, 32])" % outv)
