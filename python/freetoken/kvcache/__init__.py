@@ -66,10 +66,21 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
-def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
+def create_kv_pool(
+    config,
+    num_pages: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    kv_quant: str = "bf16",
+):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
-    the pool). Single factory entry for all pool families, DSV4 included."""
+    the pool). Single factory entry for all pool families, DSV4 included.
+
+    ``kv_quant`` selects the per-element format: "bf16" (default, plain bf16) or
+    "q8_0" (llama.cpp-style block-wise int8 + fp16 scale; only MHAKVCache wires it
+    through this build -- other pools ignore it). "q4_0" is accepted upstream and
+    already rewritten to bf16 by EngineConfig.__post_init__."""
     from .dsv4_cost_model import _dsv4_pool_sizes
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
     from .dsv4_paged_pool import DSV4PagedKVCache
@@ -106,6 +117,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         num_swa_tokens=num_swa_tokens,
         device=device,
         dtype=dtype,
+        kv_quant=kv_quant,
     )
 
 
@@ -116,6 +128,7 @@ def create_kvcache_pool(
     dtype: torch.dtype,
     device: torch.device,
     num_swa_tokens: int | None = None,
+    kv_quant: str = "bf16",
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -207,6 +220,7 @@ def create_kvcache_pool(
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        kv_quant=kv_quant,
     )
 
 

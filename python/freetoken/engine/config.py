@@ -75,6 +75,12 @@ class EngineConfig:
     # instead of asserting on a negative budget; "cpu" = host-resident KV (experimental,
     # requires an attention backend that can read host pages).
     kv_device: str = "cuda"
+    # KV cache value format. "bf16" = plain bf16 (default); "q8_0" = llama.cpp-style
+    # block-wise 8-bit quant (32 elem/block: int8 data + fp16 scale, ~1.06 byte/elem,
+    # ~1/2 of bf16); "q4_0" is accepted but currently falls back to bf16 with a warning
+    # at startup (q4_0 / subnormal handling is not yet implemented in this build).
+    kv_quant: str = "bf16"
+
     # compressed-tensors FP8 policy: "native" keeps float8 weights on the W8A16 kernel;
     # "bf16" dequantizes every FP8 dense weight at load (larger footprint, reference path).
     ct_fp8: str = "native"
@@ -104,6 +110,16 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+
+    def __post_init__(self) -> None:
+        # q4_0 is reserved: warn and fall back to bf16. Done at the config layer so the
+        # rest of the engine never has to know about it.
+        if self.kv_quant == "q4_0":
+            from freetoken.utils import init_logger
+            init_logger(__name__).warning(
+                "kv-quant=q4_0 not implemented in this build, falling back to bf16"
+            )
+            object.__setattr__(self, "kv_quant", "bf16")
 
     @cached_property
     def hf_config(self):

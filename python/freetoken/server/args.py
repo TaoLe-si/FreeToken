@@ -608,6 +608,17 @@ def parse_args(
             " shared pool); cpu = host-resident KV (experimental)."
         ),
     )
+    parser.add_argument(
+        "--kv-quant",
+        choices=["bf16", "q8_0", "q4_0"],
+        default=ServerArgs.kv_quant,
+        help=(
+            "KV cache value format: bf16 (default) = plain bf16; q8_0 = llama.cpp-style"
+            " block-wise 8-bit quant (32 elem/block: int8 data + fp16 scale, ~1/2 the bf16"
+            " footprint); q4_0 = reserved, currently falls back to bf16 with a warning at"
+            " startup (not yet implemented in this build)."
+        ),
+    )
 
     parser.add_argument(
         "--moe-cache-policy",
@@ -838,6 +849,8 @@ def _build_option_schema() -> dict:
     kv.add_argument("--max-batch-rows", type=int, default=None, help="Max KV pool rows")
     kv.add_argument("--kv-device", choices=["cuda", "shared", "cpu"], default="cuda",
                     help="KV placement: cuda (VRAM budget), shared (WDDM shared pool, may exceed VRAM), cpu (experimental)")
+    kv.add_argument("--kv-quant", choices=["bf16", "q8_0", "q4_0"], default="bf16",
+                    help="KV value format: bf16 (default); q8_0 (llama.cpp-style block-wise int8 + fp16 scale); q4_0 (falls back to bf16)")
     # MoE
     moe = parser.add_argument_group("MoE / expert offload")
     moe.add_argument("--moe-backend", choices=["auto"] + [n for n in SUPPORTED_MOE_BACKENDS.supported_names()], default=None, help="MoE decode backend")

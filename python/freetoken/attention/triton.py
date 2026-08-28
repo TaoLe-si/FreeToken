@@ -188,6 +188,11 @@ class TritonAttentionBackend(BaseAttnBackend):
         assert isinstance(metadata, TritonMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
 
+        # Stage-in q8_0 storage into the bf16 view that the rest of this method (and
+        # the triton attention kernels) read. No-op for bf16 pools.
+        if getattr(self.kvcache, "_quant", "bf16") != "bf16":
+            self.kvcache.ensure_layer_dequanted(layer_id)
+
         _k_raw0 = self.kvcache.k_cache(layer_id)
         if not _k_raw0.is_cuda:
             # Host-resident pool (--kv-device cpu): the triton kernels assert on

@@ -573,7 +573,7 @@ _ALLOWED_ENGINE_FLAGS = {
     "--moe-cache-policy", "--enable-cache-report", "--sampling-defaults",
     "--moe-prefill-hit-d2d", "--decode-log-interval", "--num-tokens", "--host", "--port",
     "--dense-ffn-engine", "--igpu-service", "--igpu-no-fallback",
-    "--kv-device", "--ct-fp8", "--num-tokens-override",
+    "--kv-device", "--kv-quant", "--ct-fp8", "--num-tokens-override",
 }
 
 def _sanitize_engine_args(args):

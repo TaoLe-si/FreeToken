@@ -527,8 +527,13 @@ class Engine:
         num_tokens = self.num_pages * config.page_size
         # KV pool device: cpu for cpu mode, self.device for shared/dgpu modes
         kv_dev = torch.device("cpu") if kv_device == "cpu" else self.device
+        # q4_0 already fell back to bf16 in EngineConfig.__post_init__; default here is
+        # "bf16" if the caller passed a ServerArgs / EngineConfig without the field
+        # (legacy programmatic callers).
+        kv_quant = getattr(config, "kv_quant", "bf16")
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=kv_dev, dtype=self.dtype
+            config, self.num_pages, device=kv_dev, dtype=self.dtype,
+            kv_quant=kv_quant,
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
