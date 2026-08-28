@@ -1,26 +1,12 @@
-// MXFP4 GEMV kernel (e8m0 block scales, no per-block bias)
-//
-// Layout (server writes float32 to t1/t2; shader reads as float32):
-//   packed : StructuredBuffer<uint> of weight, K/8 uints per row (each uint = 4 nibbles)
-//   scl    : StructuredBuffer<float> of per-micro-block e8m0 scale
-//            (server decodes byte 127 to 1.0, byte 128 to 2.0, etc.)
-//            M rows of (K/32) floats
-//   act    : StructuredBuffer<float> of activations, K per row (server casts int32 -> float)
-//   bias   : StructuredBuffer<float> of per-output bias (M floats)
-//   outv   : RWStructuredBuffer<float> of outputs, M
-//   gbl    : StructuredBuffer<float> of per-output global scale (M floats)
-
-StructuredBuffer<uint>    packed : register(t0);
-StructuredBuffer<float>   scl    : register(t1);
-StructuredBuffer<float>   act    : register(t2);
-StructuredBuffer<float>   bias   : register(t3);
-RWStructuredBuffer<float> outv   : register(u0);
-StructuredBuffer<float>   gbl    : register(t4);
-
+// MXFP4 GEMV - NVFP4 formula, fully inlined e2m1
+StructuredBuffer<uint>    packed  : register(t0);
+StructuredBuffer<float>   scl     : register(t1);
+StructuredBuffer<float>   bias_pb : register(t2);
+StructuredBuffer<float>   act     : register(t3);
+StructuredBuffer<float>   gbl     : register(t4);
+StructuredBuffer<float>   rowBias : register(t5);
+RWStructuredBuffer<float> outv    : register(u0);
 cbuffer P : register(b0) { uint K; uint nbPerRow; uint nsPerRow; };
-
-// e2m1 nibble decode
-static const int kE2M1[16] = {0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12};
 
 groupshared float sh[256];
 
@@ -33,32 +19,22 @@ void main(uint3 tid : SV_DispatchThreadID,
 
     for (uint b = t; b < nbPerRow; b += 256) {
         uint pbase = row * nbPerRow + b;
-        uint sbase = row * nsPerRow + b;  // float index into scl
-
-        // Load float scale for this micro-block (server has already decoded e8m0 byte to float)
-        float bs = scl[sbase];
-
-        // Load 4 uints (16 bytes) = 32 nibbles
-        uint words[4];
-        words[0] = packed[pbase * 4u + 0u];
-        words[1] = packed[pbase * 4u + 1u];
-        words[2] = packed[pbase * 4u + 2u];
-        words[3] = packed[pbase * 4u + 3u];
-
-        int wsum = 0;
-        uint abase = b * 32u;  // element index in act
-        for (int j = 0; j < 4; j++) {
-            uint w = words[j];
-            int w0 = kE2M1[w        & 0xFu];
-            int w1 = kE2M1[(w >>  4) & 0xFu];
-            int w2 = kE2M1[(w >>  8) & 0xFu];
-            int w3 = kE2M1[(w >> 12) & 0xFu];
-            int w4 = kE2M1[(w >> 16) & 0xFu];
-            int w5 = kE2M1[(w >> 20) & 0xFu];
-            int w6 = kE2M1[(w >> 24) & 0xFu];
-            int w7 = kE2M1[(w >> 28) & 0xFu];
-            uint ai = abase + (uint)j * 8u;
-            // Load 8 acts as floats
+        uint sbase = row * nsPerRow + b;
+        float bs2 = scl[sbase];
+        float bb = bias_pb[sbase];
+        
+        float wsum = 0.0f;
+        uint ai_base = b * 32u;
+        
+        // Process 4 uints = 32 nibbles
+        for (int wordIdx = 0; wordIdx < 4; wordIdx++) {
+            uint w = packed[pbase * 4u + (uint)wordIdx];
+            uint ai = ai_base + (uint)wordIdx * 8u;
+            uint n0 = w & 0xFu; uint n1 = (w >> 4) & 0xFu;
+            uint n2 = (w >> 8) & 0xFu; uint n3 = (w >> 12) & 0xFu;
+            uint n4 = (w >> 16) & 0xFu; uint n5 = (w >> 20) & 0xFu;
+            uint n6 = (w >> 24) & 0xFu; uint n7 = (w >> 28) & 0xFu;
+            
             float a0 = act[row * K + ai + 0u];
             float a1 = act[row * K + ai + 1u];
             float a2 = act[row * K + ai + 2u];
@@ -67,10 +43,18 @@ void main(uint3 tid : SV_DispatchThreadID,
             float a5 = act[row * K + ai + 5u];
             float a6 = act[row * K + ai + 6u];
             float a7 = act[row * K + ai + 7u];
-            wsum += (int)round(w0 * a0 + w1 * a1 + w2 * a2 + w3 * a3
-                              + w4 * a4 + w5 * a5 + w6 * a6 + w7 * a7);
+            
+            // Ternary chain per nibble
+            wsum += (n0==0u?0.0f:n0==1u?1.0f:n0==2u?2.0f:n0==3u?3.0f:n0==4u?4.0f:n0==5u?6.0f:n0==6u?8.0f:n0==7u?12.0f:n0==8u?0.0f:n0==9u?-1.0f:n0==10u?-2.0f:n0==11u?-3.0f:n0==12u?-4.0f:n0==13u?-6.0f:n0==14u?-8.0f:-12.0f)*a0;
+            wsum += (n1==0u?0.0f:n1==1u?1.0f:n1==2u?2.0f:n1==3u?3.0f:n1==4u?4.0f:n1==5u?6.0f:n1==6u?8.0f:n1==7u?12.0f:n1==8u?0.0f:n1==9u?-1.0f:n1==10u?-2.0f:n1==11u?-3.0f:n1==12u?-4.0f:n1==13u?-6.0f:n1==14u?-8.0f:-12.0f)*a1;
+            wsum += (n2==0u?0.0f:n2==1u?1.0f:n2==2u?2.0f:n2==3u?3.0f:n2==4u?4.0f:n2==5u?6.0f:n2==6u?8.0f:n2==7u?12.0f:n2==8u?0.0f:n2==9u?-1.0f:n2==10u?-2.0f:n2==11u?-3.0f:n2==12u?-4.0f:n2==13u?-6.0f:n2==14u?-8.0f:-12.0f)*a2;
+            wsum += (n3==0u?0.0f:n3==1u?1.0f:n3==2u?2.0f:n3==3u?3.0f:n3==4u?4.0f:n3==5u?6.0f:n3==6u?8.0f:n3==7u?12.0f:n3==8u?0.0f:n3==9u?-1.0f:n3==10u?-2.0f:n3==11u?-3.0f:n3==12u?-4.0f:n3==13u?-6.0f:n3==14u?-8.0f:-12.0f)*a3;
+            wsum += (n4==0u?0.0f:n4==1u?1.0f:n4==2u?2.0f:n4==3u?3.0f:n4==4u?4.0f:n4==5u?6.0f:n4==6u?8.0f:n4==7u?12.0f:n4==8u?0.0f:n4==9u?-1.0f:n4==10u?-2.0f:n4==11u?-3.0f:n4==12u?-4.0f:n4==13u?-6.0f:n4==14u?-8.0f:-12.0f)*a4;
+            wsum += (n5==0u?0.0f:n5==1u?1.0f:n5==2u?2.0f:n5==3u?3.0f:n5==4u?4.0f:n5==5u?6.0f:n5==6u?8.0f:n5==7u?12.0f:n5==8u?0.0f:n5==9u?-1.0f:n5==10u?-2.0f:n5==11u?-3.0f:n5==12u?-4.0f:n5==13u?-6.0f:n5==14u?-8.0f:-12.0f)*a5;
+            wsum += (n6==0u?0.0f:n6==1u?1.0f:n6==2u?2.0f:n6==3u?3.0f:n6==4u?4.0f:n6==5u?6.0f:n6==6u?8.0f:n6==7u?12.0f:n6==8u?0.0f:n6==9u?-1.0f:n6==10u?-2.0f:n6==11u?-3.0f:n6==12u?-4.0f:n6==13u?-6.0f:n6==14u?-8.0f:-12.0f)*a6;
+            wsum += (n7==0u?0.0f:n7==1u?1.0f:n7==2u?2.0f:n7==3u?3.0f:n7==4u?4.0f:n7==5u?6.0f:n7==6u?8.0f:n7==7u?12.0f:n7==8u?0.0f:n7==9u?-1.0f:n7==10u?-2.0f:n7==11u?-3.0f:n7==12u?-4.0f:n7==13u?-6.0f:n7==14u?-8.0f:-12.0f)*a7;
         }
-        acc += (float)wsum * bs;
+        acc += (wsum + bb) * bs2;
     }
 
     sh[t] = acc;
@@ -79,5 +63,5 @@ void main(uint3 tid : SV_DispatchThreadID,
         if (t < s) sh[t] += sh[t + s];
         GroupMemoryBarrierWithGroupSync();
     }
-    if (t == 0) outv[row] = (sh[0] + bias[row]) * gbl[row];
+    if (t == 0) outv[row] = sh[0] * gbl[row] + rowBias[row];
 }

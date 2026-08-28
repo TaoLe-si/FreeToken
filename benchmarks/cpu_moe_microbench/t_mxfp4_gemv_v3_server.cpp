@@ -202,6 +202,8 @@ int main() {
             if (!readN(0, scales.data(), szS)) { fprintf(stderr, "STATELESS scales read fail\n"); continue; }
             if (!readN(0, act.data(), szA)) { fprintf(stderr, "STATELESS act read fail\n"); continue; }
             if (!readN(0, bias.data(), szB)) { fprintf(stderr, "STATELESS bias read fail\n"); continue; }
+            // Force recreation of all resources for each STATELESS request
+            weights.erase("__stateless__");
             Mxfp4Weight& w = weights["__stateless__"] = createWeight(M, K);
             UINT64 total = (UINT64)szP + szS + szO + szA + szB + szG + szG;
             if (w.uploadLoadCap < total) {
@@ -240,13 +242,21 @@ int main() {
               bs[nbb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bs[nbb].Transition.pResource = w.rR.Get(); bs[nbb].Transition.Subresource = 0; bs[nbb].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; bs[nbb].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; ++nbb;
               uploadList->ResourceBarrier(nbb, bs); }
             if (!submit(uploadList, "STATELESS-up")) continue;
-            w.rWSt = w.rSSt = w.rBSt = w.rASt = w.rGSt = w.rRSt = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            // Ensure upload completes before dispatch
+            queue->Signal(fence.Get(), ++fv);
+            fence->SetEventOnCompletion(fv, ev);
+            WaitForSingleObject(ev, 5000);
+                        w.rWSt = w.rSSt = w.rBSt = w.rASt = w.rGSt = w.rRSt = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             void* cm = nullptr; w.rCb->Map(0, nullptr, &cm);
-            struct { uint32_t K, nbPerRow, nsPerRow, pad; } cbv = { K, nb, ns, 0 };
+            struct { uint32_t K, nbPerRow, nsPerRow, pad; } cbv = { K, ns, ns, 0 };  // nbPerRow=块数(K/32), 非uint数!
             std::memcpy(cm, &cbv, sizeof(cbv));
             w.rCb->Unmap(0, nullptr);
-            dispatchList->Reset(dispatchAlloc.Get(), pso.Get());
-            dispatchList->SetComputeRootSignature(rs.Get());
+            // Recreate PSO for each STATELESS request (fix NVFP4 NaN)
+            ComPtr<ID3D12PipelineState> psoStateless;
+            device->CreateComputePipelineState(&psd, IID_PPV_ARGS(&psoStateless));
+            dispatchList->SetPipelineState(psoStateless.Get());
+            dispatchList->Reset(dispatchAlloc.Get(), psoStateless.Get());
+                        dispatchList->SetComputeRootSignature(rs.Get());
             dispatchList->SetComputeRootShaderResourceView(0, w.rW->GetGPUVirtualAddress());  // t0: packed
             dispatchList->SetComputeRootShaderResourceView(1, w.rS->GetGPUVirtualAddress());  // t1: scl (NVFP4 fp16)
             dispatchList->SetComputeRootShaderResourceView(2, w.rA->GetGPUVirtualAddress());  // t2: per-row bias (NVFP4, M*4)
@@ -260,13 +270,48 @@ int main() {
                 dispatchList->ResourceBarrier(1, &b);
                 w.rOutSt = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             }
+
+            
+            fprintf(stderr, "  DEBUG: M=%u K=%u nb=%u ns=%u\n", (unsigned)M, (unsigned)K, (unsigned)nb, (unsigned)ns);
+            fprintf(stderr, "  DEBUG: rW ptr=%llx size=%llu\n", (unsigned long long)w.rW->GetGPUVirtualAddress(), (unsigned long long)w.rW->GetDesc().Width);
+            fprintf(stderr, "  DEBUG: rS ptr=%llx size=%llu\n", (unsigned long long)w.rS->GetGPUVirtualAddress(), (unsigned long long)w.rS->GetDesc().Width);
+            fprintf(stderr, "  DEBUG: rA ptr=%llx size=%llu\n", (unsigned long long)w.rA->GetGPUVirtualAddress(), (unsigned long long)w.rA->GetDesc().Width);
+            fprintf(stderr, "  DEBUG: rB ptr=%llx size=%llu\n", (unsigned long long)w.rB->GetGPUVirtualAddress(), (unsigned long long)w.rB->GetDesc().Width);
+            fprintf(stderr, "  DEBUG: rG ptr=%llx size=%llu\n", (unsigned long long)w.rG->GetGPUVirtualAddress(), (unsigned long long)w.rG->GetDesc().Width);
+            fprintf(stderr, "  DEBUG: rR ptr=%llx size=%llu\n", (unsigned long long)w.rR->GetGPUVirtualAddress(), (unsigned long long)w.rR->GetDesc().Width);
+            fprintf(stderr, "  DEBUG: rOut ptr=%llx size=%llu\n", (unsigned long long)w.rOut->GetGPUVirtualAddress(), (unsigned long long)w.rOut->GetDesc().Width);
+            fprintf(stderr, "  DEBUG: rCb ptr=%llx size=%llu\n", (unsigned long long)w.rCb->GetGPUVirtualAddress(), (unsigned long long)w.rCb->GetDesc().Width);
+            // Read back first few values from upload buffer
+            void* dbg_m = nullptr; w.uploadLoad->Map(0, nullptr, &dbg_m);
+            float* dbg_f = (float*)((char*)dbg_m + offP);
+            fprintf(stderr, "  DEBUG: upload[0..3]=0x%08X 0x%08X 0x%08X 0x%08X\n", 
+                    ((uint32_t*)dbg_m)[0], ((uint32_t*)dbg_m)[1], ((uint32_t*)dbg_m)[2], ((uint32_t*)dbg_m)[3]);
+            fprintf(stderr, "  DEBUG: upload[offS..offS+3]=0x%08X 0x%08X 0x%08X 0x%08X\n", 
+                    ((uint32_t*)((char*)dbg_m + offS))[0], ((uint32_t*)((char*)dbg_m + offS))[1], 
+                    ((uint32_t*)((char*)dbg_m + offS))[2], ((uint32_t*)((char*)dbg_m + offS))[3]);
+            fprintf(stderr, "  DEBUG: upload[offA..offA+3]=%f %f %f %f\n", 
+                    ((float*)((char*)dbg_m + offA))[0], ((float*)((char*)dbg_m + offA))[1],
+                    ((float*)((char*)dbg_m + offA))[2], ((float*)((char*)dbg_m + offA))[3]);
+            fprintf(stderr, "  DEBUG: upload[offB..offB+3]=%f %f %f %f\n", 
+                    ((float*)((char*)dbg_m + offB))[0], ((float*)((char*)dbg_m + offB))[1],
+                    ((float*)((char*)dbg_m + offB))[2], ((float*)((char*)dbg_m + offB))[3]);
+            w.uploadLoad->Unmap(0, nullptr);
+            
             dispatchList->Dispatch((UINT)M, 1, 1);
             { D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = w.rOut.Get(); b.Transition.Subresource = 0; b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
               dispatchList->ResourceBarrier(1, &b);
               w.rOutSt = D3D12_RESOURCE_STATE_COPY_SOURCE; }
             dispatchList->CopyResource(w.rRb.Get(), w.rOut.Get());
-            if (!submit(dispatchList, "STATELESS-dispatch")) continue;
+            // Read back rOut
             void* om = nullptr; w.rRb->Map(0, nullptr, &om);
+            fprintf(stderr, "  DEBUG: outv raw bytes = %02X %02X %02X %02X\n",
+                    ((uint8_t*)om)[0], ((uint8_t*)om)[1], ((uint8_t*)om)[2], ((uint8_t*)om)[3]);
+            w.rRb->Unmap(0, nullptr);
+            
+            if (!submit(dispatchList, "STATELESS-dispatch")) continue;
+            w.rRb->Map(0, nullptr, &om);
+            fprintf(stderr, "  DEBUG: rRb bytes after submit = %02X %02X %02X %02X\n",
+                    ((uint8_t*)om)[0], ((uint8_t*)om)[1], ((uint8_t*)om)[2], ((uint8_t*)om)[3]);
             writeAll(1, &szOut, 4);
             writeAll(1, om, szOut);
             w.rRb->Unmap(0, nullptr);
@@ -324,7 +369,7 @@ int main() {
             if (!submit(uploadList, "MULTI_GEMV-up")) continue;
             mw.rWSt = mw.rSSt = mw.rBSt = mw.rASt = mw.rGSt = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             void* cm = nullptr; mw.rCb->Map(0, nullptr, &cm);
-            struct { uint32_t B, K, nbPerRow, nsPerRow; } cbv = { B, K, nb, ns };
+            struct { uint32_t K, nbPerRow, nsPerRow, pad; } cbv = { K, ns, ns, 0 };  // 同STATELESS: nbPerRow=块数(K/32)
             std::memcpy(cm, &cbv, sizeof(cbv));
             mw.rCb->Unmap(0, nullptr);
             dispatchList->Reset(dispatchAlloc.Get(), pso.Get());
