@@ -1324,10 +1324,17 @@ class Engine:
                 if (
                     not is_verify
                     and not os.environ.get("FT_DISABLE_DECODE_REPLAY")  # replay default-on; opt-out for debug
-                    # 2026-09-01: decode replay corrupts GDN state under MTP (outputs
-                    # loop after ~3 tokens; bit-exact eager matches pure decode).
-                    # Replay stays off for MTP until the capture-time state
-                    # interference is root-caused. See DELIVERY_2026-0901.md.
+                    # 2026-09-01 (final): decode replay stays OFF under MTP with the
+                    # offload MoE slot cache. Root cause is NOT output-buffer aliasing
+                    # (cloning logits/prev_hidden/all_hidden below did not fix it) but
+                    # Bug A from DELIVERY_2026-0901.md: copy_missing's DMA/LRU slot
+                    # plan is host-driven per eager step; a replay freezes the capture-
+                    # time plan, so every decode step with an expert-cache miss reads
+                    # the WRONG expert weights. The slot cache is one flat (layer,
+                    # expert) pool (cache_size 868 << 40 layers x 256 experts), so
+                    # decode misses are the norm -> replay is structurally unsafe
+                    # until decode either pins whole layers (prefill_overlap style)
+                    # or runs on the cpu/igpu executors that bypass the slot cache.
                     and not getattr(self.config, "mtp", False)
                     and self.graph_runner.can_use_cuda_graph(batch)
                     and getattr(self.graph_runner, "_captures_hidden", False)
@@ -1345,8 +1352,15 @@ class Engine:
                     batch.mtp_logits_buf = self.graph_runner.buffer.logits
                     batch.graph_handle = self.graph_runner.graph_map[batch.padded_size]
                     logits, prev_hidden, all_hidden = self.model.forward_with_hidden()
+                    # CLONE logits/all_hidden too: they alias the persistent
+                    # GraphCaptureBuffer just like prev_hidden (fixed below), and the
+                    # next replay overwrites them before the overlap scheduler drains
+                    # this batch. Draining stale/shifted logits corrupts the token
+                    # stream within a few steps (the 2026-09-01 long-output
+                    # divergence; non-MTP builds never replay so they were immune).
+                    logits = logits[: batch.input_ids.shape[0]].detach().clone()
                     if all_hidden is not None:
-                        all_hidden = all_hidden[: batch.input_ids.shape[0]].detach()
+                        all_hidden = all_hidden[: batch.input_ids.shape[0]].detach().clone()
                     if prev_hidden is not None:
                         # CLONE: prev_hidden aliases the persistent GraphCaptureBuffer --
                         # the NEXT replay would overwrite it before the overlap scheduler
