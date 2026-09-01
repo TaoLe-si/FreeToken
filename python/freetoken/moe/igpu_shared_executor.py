@@ -28,12 +28,15 @@ from __future__ import annotations
 
 import ctypes
 import os
+import time
 
 import torch
 
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
+
+from freetoken.engine.engine import _IGPU_RESERVED
 
 _ROCM_BIN = r"C:\Program Files\AMD\ROCm\6.4\bin"
 _HIP_DLL = "amdhip64_6.dll"
@@ -80,6 +83,16 @@ def _load_dlls(path):
     dll.igpu_hostmalloc.argtypes = [ctypes.c_size_t]
     dll.igpu_hostfree.restype = ctypes.c_int
     dll.igpu_hostfree.argtypes = [ctypes.c_void_p]
+    hip.hipStreamCreate.argtypes = [ctypes.c_void_p]
+    hip.hipStreamCreate.restype = ctypes.c_int
+    hip.hipStreamDestroy.argtypes = [ctypes.c_void_p]
+    hip.hipStreamDestroy.restype = ctypes.c_int
+    hip.hipStreamSynchronize.argtypes = [ctypes.c_void_p]
+    hip.hipStreamSynchronize.restype = ctypes.c_int
+    hip.hipMemcpyAsync.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
+    hip.hipMemcpyAsync.restype = ctypes.c_int
+    hip.hipMemset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+    hip.hipMemset.restype = ctypes.c_int
     dll.igpu_version.restype = ctypes.c_char_p
     dll.igpu_version.argtypes = []
     return hip, dll
@@ -146,14 +159,12 @@ class IgpuSharedMoeExecutor:
     # ------------------------------------------------------------------
 
     def register_banks(self) -> None:
-        """Migrate every layer's six banks into HIP shared (mapped) memory.
+        """Form-2: migrate all six banks per layer into 780M device memory (GTT).
 
-        hipHostRegister on >96MB CUDA-pinned pages silently fails on this
-        ROCm/780M combo (iGPU reads zeros), while hipHostMalloc works at any
-        size. So we allocate an equivalent shared buffer per bank, copy the
-        bytes in, and REPLACE the cache's bank tensor with a torch view on the
-        shared memory. Net steady-state host usage is unchanged: the original
-        cudaHostAlloc bank is dropped with the reference.
+        hipMalloc on this APU returns GTT-backed device memory that kernels read
+        natively (26.6 GB/s measured), sidestepping the WDDM host-mapping defect.
+        Weight bytes are pushed once via hipMemcpy H2D; the host pinned original
+        is released so steady-state host usage drops by the full bank size.
         """
         if self._registered:
             return
@@ -162,45 +173,47 @@ class IgpuSharedMoeExecutor:
         if missing:
             raise RuntimeError(f"cache bank_sources missing banks: {missing}")
         self._validate_bank_shapes(sources)
-        self._diag("register_banks entered: migration mode")
+        logger.info_rank0("iGPU register_banks: reserved=%d", len(_IGPU_RESERVED))
+        self.hip.hipMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        H2D = 1
+        f_b = ctypes.c_size_t(0); t_b = ctypes.c_size_t(0)
+        if self.dll.igpu_meminfo(ctypes.byref(f_b), ctypes.byref(t_b)) == 0:
+            logger.info("GTT meminfo before migration: free=%.2f GB total=%.2f GB", f_b.value / 2**30, t_b.value / 2**30)
+        t0 = time.perf_counter()
         for layer_id in range(self.num_layers):
-            ptrs = []
+            dev_ptrs = []
             for name in _BANK_ORDER:
                 t = sources[name][layer_id]
-                assert t.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
+                assert t is not None and t.is_contiguous(), f"bank {name!r} layer {layer_id}"
                 nbytes = t.numel() * t.element_size()
-                # 1) shared mapped allocation (iGPU-visible at any size)
-                h = self.dll.igpu_hostmalloc(ctypes.c_size_t(nbytes))
-                if not h:
-                    raise RuntimeError(
-                        f"igpu_hostmalloc({nbytes}) failed for {name!r} layer {layer_id}"
-                    )
-                # 2) copy the weight bytes in (host-to-host memcpy)
-                ctypes.memmove(h, ctypes.c_void_p(t.data_ptr()), nbytes)
-                # 3) replace the cache entry: old cudaHostAlloc block is freed
-                #    with the dropped reference (steady-state usage unchanged)
-                sources[name][layer_id] = torch.frombuffer(
-                    (ctypes.c_char * nbytes).from_address(h),
-                    dtype=t.dtype,
-                ).view(t.shape)
-                ptrs.append(h)
-            rc = self.dll.igpu_register_layer(layer_id, *(ctypes.c_void_p(p) for p in ptrs))
+                if _IGPU_RESERVED:
+                    d = _IGPU_RESERVED.pop(0)
+                else:
+                    d = self.dll.igpu_devmalloc(ctypes.c_size_t(nbytes))
+                    if not d:
+                        raise RuntimeError(f"igpu_devmalloc({nbytes}) failed for {name!r} layer {layer_id}")
+                CHUNK = 64 * 1024 * 1024
+                src_base = t.data_ptr()
+                rc = 0
+                for off in range(0, nbytes, CHUNK):
+                    n = min(CHUNK, nbytes - off)
+                    rc = self.hip.hipMemcpy(d + off, ctypes.c_void_p(src_base + off), ctypes.c_size_t(n), H2D)
+                    if rc != 0:
+                        logger.info("H2D CHUNK FAIL rc=%s name=%s layer=%s off=%s n=%s", rc, name, layer_id, off, n)
+                        break
+                if rc != 0:
+                    raise RuntimeError(f"hipMemcpy H2D failed ({rc}) for {name!r} layer {layer_id}")
+                dev_ptrs.append(d)
+                sources[name][layer_id] = None
+            rc = self.dll.igpu_register_layer_dev(layer_id, *(ctypes.c_void_p(p) for p in dev_ptrs))
             if rc != 0:
-                raise RuntimeError(f"igpu_register_layer({layer_id}) failed with {rc}")
-            self._bank_ptrs.append(tuple(ptrs))
-            if layer_id == 0:
-                # 别名读回校验: iGPU 视角是否看到真实权重
-                chk = (ctypes.c_char * 64).from_address(self.dll.igpu_hostmalloc(ctypes.c_size_t(64)))
-                dp = ctypes.c_void_p()
-                self.hip.hipHostGetDevicePointer(ctypes.byref(dp), ctypes.c_void_p(ptrs[0]), 0)
-                chk_dp = ctypes.c_void_p()
-                self.hip.hipHostGetDevicePointer(ctypes.byref(chk_dp), ctypes.cast(chk, ctypes.c_void_p), 0)
-                self.hip.hipMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-                rc3 = self.hip.hipMemcpy(chk_dp, dp, ctypes.c_size_t(64), 2)
-                host_bytes = ctypes.string_at(ctypes.c_void_p(ptrs[0]), 64)
-                alias_bytes = chk.raw
-                self._diag(f"L0 bank readback: rc={rc3} match={host_bytes == alias_bytes} host_nz={sum(1 for b in host_bytes if b)}/64 alias_nz={sum(1 for b in alias_bytes if b)}/64")
+                raise RuntimeError(f"igpu_register_layer_dev({layer_id}) failed with {rc}")
+            self._bank_ptrs.append(tuple(dev_ptrs))
         self._registered = True
+        self._migrate_s = time.perf_counter() - t0
+        if self.dll.igpu_meminfo(ctypes.byref(f_b), ctypes.byref(t_b)) == 0:
+            logger.info("GTT meminfo after migration: free=%.2f GB total=%.2f GB (%.1fs)", f_b.value / 2**30, t_b.value / 2**30, self._migrate_s)
+
 
     def _validate_bank_shapes(self, sources: dict) -> None:
         """Fail loudly on a layout the hardcoded DLL geometry cannot serve."""
@@ -286,63 +299,59 @@ class IgpuSharedMoeExecutor:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """One MoE layer of decode on the iGPU. Returns a GPU [bs, H] tensor.
+        """One MoE layer of decode on the 780M. Returns a GPU [bs, H] tensor.
 
-        Synchronous today: the DLL blocks on its HIP stream per call, so the
-        batch is flattened to per-token invocations and the results ship back
-        with one H2D copy on the current CUDA stream."""
+        Form-2 data path: banks live in 780M device memory (GTT). Per token:
+        hidden/ids/weights go host->780M via hipMemcpy (8KB + 64B), the kernel
+        reads device banks natively, and the result comes back host->dGPU.
+        """
         assert self._registered, "register_banks() must run before decode"
         assert hidden_states.shape[1] == _H, hidden_states.shape
         assert topk_ids.shape[-1] == _EXPECTED_TOP_K, topk_ids.shape
         bs = int(hidden_states.shape[0])
-        self._diag(f"decode enter layer={layer_id} bs={bs} hid={hidden_states.data_ptr():#x} dtype={hidden_states.dtype} ids={topk_ids.data_ptr():#x} tkw={topk_weights.data_ptr():#x} wdtype={topk_weights.dtype}")
-        pinned_hidden, pinned_ids, pinned_weights, pinned_out = self._io_for(bs)
         stream = torch.cuda.current_stream()
+        self.hip.hipMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        H2D, D2H = 1, 2
 
-        # D2H: activations + routing onto the HIP-registered pinned buffers.
-        # float32 converts from whatever compute dtype the model runs (bf16/fp16).
-        pinned_hidden.copy_(hidden_states, non_blocking=True)
-        pinned_ids.copy_(topk_ids.to(torch.int32), non_blocking=True)
-        pinned_weights.copy_(topk_weights.to(torch.float32), non_blocking=True)
-        # The copies must be complete before the host hands the pointers to the
-        # HIP stream (the DLL reads them via its own device alias + host sync).
+        hidden_cpu = hidden_states.to(torch.float32).cpu()
+        ids_cpu = topk_ids.to(torch.int32).cpu()
+        weights_cpu = topk_weights.to(torch.float32).cpu()
         stream.synchronize()
 
-        out_rows = []
+        # one-time device IO staging buffers (780M side)
+        if getattr(self, "_dev_io", None) is None or self._dev_io[0] < bs:
+            if getattr(self, "_dev_io", None) is not None:
+                for p in self._dev_io[1]:
+                    self.dll.igpu_devfree(p)
+            d_h = self.dll.igpu_devmalloc(ctypes.c_size_t(bs * _H * 4))
+            d_i = self.dll.igpu_devmalloc(ctypes.c_size_t(bs * _EXPECTED_TOP_K * 4))
+            d_w = self.dll.igpu_devmalloc(ctypes.c_size_t(bs * _EXPECTED_TOP_K * 4))
+            d_o = self.dll.igpu_devmalloc(ctypes.c_size_t(bs * _H * 4))
+            if not all((d_h, d_i, d_w, d_o)):
+                raise RuntimeError("igpu_devmalloc failed on decode IO staging")
+            self._dev_io = (bs, (d_h, d_i, d_w, d_o))
+            logger.info('iGPU dev IO staging: d_h=%s d_i=%s d_w=%s d_o=%s bs=%d', hex(d_h or 0), hex(d_i or 0), hex(d_w or 0), hex(d_o or 0), bs)
+        _, (d_h, d_i, d_w, d_o) = self._dev_io
+        self.hip.hipMemcpy(d_h, ctypes.c_void_p(hidden_cpu[0].data_ptr()), ctypes.c_size_t(bs * _H * 4), H2D)
+        self.hip.hipMemcpy(d_i, ctypes.c_void_p(ids_cpu[0].data_ptr()), ctypes.c_size_t(bs * _EXPECTED_TOP_K * 4), H2D)
+        self.hip.hipMemcpy(d_w, ctypes.c_void_p(weights_cpu[0].data_ptr()), ctypes.c_size_t(bs * _EXPECTED_TOP_K * 4), H2D)
+
+        out_host = torch.empty((bs, _H), dtype=torch.float32)
         for i in range(bs):
-            self._diag(f"call igpu_moe_decode tok={i} hid={pinned_hidden[i].data_ptr():#x} ids={pinned_ids[i].data_ptr():#x} tkw={pinned_weights[i].data_ptr():#x} out={pinned_out.data_ptr():#x}")
-            rc = self.dll.igpu_moe_decode(
+            rc = self.dll.igpu_moe_decode_dev(
                 int(layer_id),
-                ctypes.c_void_p(pinned_hidden[i].data_ptr()),
-                ctypes.c_void_p(pinned_ids[i].data_ptr()),
-                ctypes.c_void_p(pinned_weights[i].data_ptr()),
-                ctypes.c_void_p(pinned_out.data_ptr()),
+                ctypes.c_void_p(d_h + i * _H * 4),
+                ctypes.c_void_p(d_i + i * _EXPECTED_TOP_K * 4),
+                ctypes.c_void_p(d_w + i * _EXPECTED_TOP_K * 4),
+                ctypes.c_void_p(d_o),
             )
             if rc != 0:
                 raise RuntimeError(
-                    f"igpu_moe_decode(layer={layer_id}, token={i}) failed with {rc}"
+                    f"igpu_moe_decode_dev(layer={layer_id}, token={i}) failed with {rc}"
                 )
-            out_rows.append(pinned_out.clone())
-
-        self._dump(layer_id, pinned_hidden, pinned_ids, pinned_weights, out_rows)
-        if layer_id == 0 and not getattr(self, "_hid_checked", False):
-            self._hid_checked = True
-            dp = ctypes.c_void_p()
-            self.hip.hipHostGetDevicePointer(ctypes.byref(dp), ctypes.c_void_p(pinned_hidden[0].data_ptr()), 0)
-            chk = self.dll.igpu_hostmalloc(ctypes.c_size_t(64))
-            chk_dp = ctypes.c_void_p()
-            self.hip.hipHostGetDevicePointer(ctypes.byref(chk_dp), ctypes.c_void_p(chk), 0)
-            self.hip.hipMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-            self.hip.hipMemcpy(chk_dp, dp, ctypes.c_size_t(64), 2)
-            import struct
-            host_v = struct.unpack("4f", ctypes.string_at(ctypes.c_void_p(pinned_hidden[0].data_ptr()), 16))
-            alias_v = struct.unpack("4f", ctypes.string_at(ctypes.c_void_p(chk), 16))
-            self._diag(f"hidden alias check: hid_host={hex(pinned_hidden[0].data_ptr())} dp={hex(dp.value or 0)} host={host_v} alias={alias_v}")
-        # H2D back: stack the per-token rows host-side, then one async copy onto
-        # the current CUDA stream.
-        out_host = torch.stack(out_rows)  # [bs, H] host
+            self.hip.hipMemcpy(ctypes.c_void_p(out_host[i].data_ptr()), d_o, ctypes.c_size_t(_H * 4), D2H)
         out = torch.empty((bs, _H), dtype=hidden_states.dtype, device=self.device)
-        out.copy_(out_host, non_blocking=True)  # H2D f32 -> cast to model dtype
+        out.copy_(out_host, non_blocking=False)
         return out
 
     def health_check(self) -> bool:

@@ -302,10 +302,10 @@ class OffloadMoeCache:
         )
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
-        if any(r != HostResidency.PINNED.value for r in residency):
+        if any(r not in (HostResidency.PINNED.value, HostResidency.LOCKED.value, HostResidency.PAGEABLE.value) for r in residency):
             raise NotImplementedError(
                 "non-pinned host bank layers need platform-specific movement "
-                "paths that are not implemented; only pinned layers are served"
+                "paths that are not implemented; only pinned/locked layers are served"
             )
         self.layer_residency = list(residency)
         for name in self.bank_schema:
@@ -325,9 +325,13 @@ class OffloadMoeCache:
                 device=self.device,
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
-        self._build_copy_plan()
-        if self.prefill_overlap:
-            self._init_prefill_overlap_buffers()
+        igpu_mode = any(r not in (HostResidency.PINNED.value,) for r in self.layer_residency)
+        if igpu_mode:
+            self.prefill_overlap = False
+        if not igpu_mode:
+            self._build_copy_plan()
+            if self.prefill_overlap:
+                self._init_prefill_overlap_buffers()
 
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
@@ -438,7 +442,8 @@ class OffloadMoeCache:
                 (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
-        self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
+        if all(r == "pinned" for r in getattr(self, "layer_residency", [])):
+            self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
         self.slot_for_id.fill_(-1)
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
@@ -496,7 +501,7 @@ class OffloadMoeCache:
         IO buffers, and the ``cudaLaunchHostFunc`` submit/sync plumbing. It reads
         experts straight from this cache's host ``bank_sources`` (no extra copy).
         """
-        assert self.decode_target in ("cpu", "hybrid"), (
+        assert self.decode_target in ("cpu", "hybrid", "igpu"), (
             "set_cpu_executor requires decode_target in {'cpu','hybrid'}"
         )
         self.cpu_executor = executor

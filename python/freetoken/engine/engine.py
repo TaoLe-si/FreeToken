@@ -26,7 +26,28 @@ from freetoken.kvcache.linear_state_pool import (
     _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
 )
 
+
 logger = init_logger(__name__)
+
+# Form-2 iGPU: reserve 780M GTT device banks at process start, before any
+# CUDA context grows. Empirically hipMalloc returns unusable low VAs once the
+# engine has loaded the model; reserved VA is fine. Activated only in the
+# scheduler worker (FT_IGPU_RESERVE=1).
+_IGPU_RESERVED: list[int] = []
+if os.environ.get("FT_IGPU_RESERVE") == "1":
+    try:
+        from freetoken.moe.igpu_shared_executor import _load_dlls as _igpu_ld
+        _igpu_hip, _igpu_dll = _igpu_ld(None)
+        _igpu_dll.igpu_init()
+        import ctypes as _igpu_ct
+        for _i in range(40):
+            _p = _igpu_dll.igpu_devmalloc(_igpu_ct.c_size_t(433000000))
+            if not _p:
+                break
+            _IGPU_RESERVED.append(_p)
+        logger.info_rank0("iGPU GTT reserve: %d banks at process start", len(_IGPU_RESERVED))
+    except Exception as _e:
+        logger.info_rank0("iGPU GTT reserve skipped: %s", _e)
 
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:

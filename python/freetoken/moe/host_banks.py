@@ -176,9 +176,22 @@ _os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks f
 
 def _os_lock(addr: int, nbytes: int) -> None:
     global _os_locked_total
+    import ctypes as _ct
+    import sys as _sys
+    if _sys.platform == "win32":
+        k32 = _ct.WinDLL("kernel32", use_last_error=True)
+        k32.VirtualLock.argtypes = [_ct.c_void_p, _ct.c_size_t]
+        k32.VirtualLock.restype = _ct.c_int
+        need = _os_locked_total + nbytes + (512 << 20)
+        k32.SetProcessWorkingSetSizeEx(k32.GetCurrentProcess(),
+            _ct.c_size_t(need), _ct.c_size_t(need + (256 << 20)), _ct.c_size_t(0))
+        if not k32.VirtualLock(_ct.c_void_p(addr), _ct.c_size_t(nbytes)):
+            err = _ct.get_last_error()
+            raise OSError(err, f"VirtualLock({nbytes / 2**30:.1f} GiB) failed: winerror {err}")
+        _os_locked_total += nbytes
+        return
     import resource
-
-    # grow the soft RLIMIT_MEMLOCK (defaults to a few MiB); the hard limit needs privilege, past it mlock fails below
+    # grow the soft RLIMIT_MEMLOCK; the hard limit needs privilege
     want = _os_locked_total + nbytes + (256 << 20)
     soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
     if soft != resource.RLIM_INFINITY and soft < want:
@@ -187,7 +200,7 @@ def _os_lock(addr: int, nbytes: int) -> None:
             try:
                 resource.setrlimit(resource.RLIMIT_MEMLOCK, (new_soft, hard))
             except (OSError, ValueError):
-                pass  # keep the old limit; mlock below reports the real ceiling
+                pass
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(nbytes)):
         err = ctypes.get_errno()

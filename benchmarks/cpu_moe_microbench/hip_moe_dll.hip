@@ -226,6 +226,24 @@ static float* g_h_out = nullptr;
 static hipStream_t g_stream = nullptr;
 static int g_init = 0;
 
+DLLEXPORT int igpu_meminfo(size_t* free_b, size_t* total_b) {
+    return hipMemGetInfo(free_b, total_b) == hipSuccess ? 0 : -1;
+}
+
+DLLEXPORT void* igpu_devmalloc(size_t nbytes) {
+    void* p = nullptr;
+    hipError_t rc = hipMalloc(&p, nbytes);
+    if (rc != hipSuccess) {
+        diag("devmalloc %zu failed: %d\n", nbytes, (int)rc);
+        return nullptr;
+    }
+    return p;
+}
+
+DLLEXPORT int igpu_devfree(void* p) {
+    return hipFree(p) == hipSuccess ? 0 : -1;
+}
+
 DLLEXPORT void* igpu_hostmalloc(size_t nbytes) {
     void* h = nullptr;
     hipError_t rc = hipHostMalloc(&h, nbytes, hipHostMallocMapped);
@@ -258,6 +276,20 @@ DLLEXPORT int igpu_init(void) {
     return 0;
 }
 
+DLLEXPORT int igpu_register_layer_dev(int layer,
+    void* gu_pack, void* gu_scale, void* gu_global,
+    void* dn_pack, void* dn_scale, void* dn_global) {
+    // 形态二: 指针已是 hipMalloc 设备内存, 直接登记
+    if (layer < 0 || layer >= MAX_LAYERS) return -1;
+    g_banks[layer].gu_pack   = (const unsigned char*)gu_pack;
+    g_banks[layer].gu_scale  = (const unsigned char*)gu_scale;
+    g_banks[layer].gu_global = (const unsigned short*)gu_global;
+    g_banks[layer].dn_pack   = (const unsigned char*)dn_pack;
+    g_banks[layer].dn_scale  = (const unsigned char*)dn_scale;
+    g_banks[layer].dn_global = (const unsigned short*)dn_global;
+    return 0;
+}
+
 DLLEXPORT int igpu_register_layer(int layer,
     void* gu_pack, void* gu_scale, void* gu_global,
     void* dn_pack, void* dn_scale, void* dn_global) {
@@ -280,6 +312,35 @@ DLLEXPORT int igpu_register_layer(int layer,
             case 5: g_banks[layer].dn_global = (const unsigned short*)d; break;
         }
     }
+    return 0;
+}
+
+DLLEXPORT int igpu_moe_decode_dev(int layer,
+    const float* hidden, const int* topk_ids, const float* topkw, float* out) {
+    // 形态二: 全部为 780M 设备指针; bank 已登记, IO 也应在设备内存
+    if (!g_init || layer < 0 || layer >= MAX_LAYERS) return -1;
+    auto& b = g_banks[layer];
+    if (!b.gu_pack) return -2;
+    {   // 路由 id 越界防御
+        int ids_host[8];
+        hipError_t rc = hipMemcpy(ids_host, topk_ids, E * sizeof(int), hipMemcpyDeviceToHost);
+        if (rc != hipSuccess) { diag("decode_dev ids D2H failed: %d (ids_ptr=%p)\n", (int)rc, (const void*)topk_ids); return -9; }
+        for (int i = 0; i < E; i++) {
+            if (ids_host[i] < 0 || ids_host[i] >= 256) {
+                diag("bad topk_ids[%d]=%d\n", i, ids_host[i]);
+                return -7;
+            }
+        }
+    }
+    CHK(hipMemsetAsync(d_out, 0, DN_ROWS * sizeof(float), g_stream));
+    hipLaunchKernelGGL(k_gate_up, dim3(E * (GU_ROWS / GU_RPB)), dim3(GU_BLOCK), 0, g_stream,
+                       b.gu_pack, b.gu_scale, b.gu_global, hidden, topk_ids, d_gu);
+    hipLaunchKernelGGL(k_act, dim3((E * INTER) / 256), dim3(256), 0, g_stream, d_gu, d_act);
+    hipLaunchKernelGGL(k_down, dim3(E * (DN_ROWS / DN_RPB)), dim3(DN_BLOCK), 0, g_stream,
+                       b.dn_pack, b.dn_scale, b.dn_global, d_act, topkw, topk_ids, out);
+    hipError_t le = hipGetLastError();
+    if (le != hipSuccess) { diag("launch err: %s\n", hipGetErrorString(le)); return -3; }
+    CHK(hipStreamSynchronize(g_stream));
     return 0;
 }
 
@@ -355,5 +416,5 @@ DLLEXPORT int igpu_moe_decode(int layer,
 }
 
 DLLEXPORT const char* igpu_version(void) {
-    return "P1b hip_moe_dll v7-bankprobe (gfx1103, NVFP4, E=8, topk_ids routing)";
+    return "P1b hip_moe_dll v8.2-devbanks (gfx1103, NVFP4, E=8, topk_ids routing)";
 }
