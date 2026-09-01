@@ -602,8 +602,7 @@ def _sanitize_engine_args(args):
                 i += 1
             i += 1
             continue
-        if flag == "--moe-backend" and (val or "") == "igpu":
-            val = "hybrid"  # 0.1.1 release has no igpu backend
+        # P2: --moe-backend igpu now supported via IgpuSharedMoeExecutor (HIP shared-pool)
         if flag in ("--dtype",) and val == "auto":
             pass
         if has_val:

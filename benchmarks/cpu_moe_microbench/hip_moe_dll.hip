@@ -1,10 +1,20 @@
 #include <hip/hip_runtime.h>
 #include <cstdio>
+#include <cstdarg>
 #include <cstdlib>
 #include <cstring>
 
 #define CHK(x) do { hipError_t e_=(x); if(e_!=hipSuccess){fprintf(stderr,"HIP ERR %s @%d: %s\n",#x,__LINE__,hipGetErrorString(e_)); return -1;} } while(0)
 #define DLLEXPORT extern "C" __attribute__((dllexport))
+
+static void diag(const char* fmt, ...) {
+    FILE* f = fopen("E:/FreeToken/igpu_dll_diag.log", "a");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fclose(f);
+}
 
 static const int E       = 8;
 static const int GU_ROWS = 1024;   // gate 512 + up 512
@@ -93,6 +103,18 @@ __device__ static inline float dot_chunk_f4(const float4 chunk,
 
 // ---- k_gate_up: with topk_ids routing ----
 static const int GU_RPB = 8, GU_TPR = 16, GU_CPL = 4, GU_BLOCK = GU_RPB * GU_TPR;
+
+__global__ void k_probe_bank(const unsigned char* __restrict__ bank, const unsigned short* __restrict__ glob, float* __restrict__ dst) {
+    if (threadIdx.x == 0) {
+        dst[0] = (float)bank[0]; dst[1] = (float)bank[1];
+        dst[2] = (float)bank[2]; dst[3] = (float)bank[3];
+        dst[4] = (float)glob[0];
+    }
+}
+
+__global__ void k_probe(const float* __restrict__ src, float* __restrict__ dst) {
+    if (threadIdx.x == 0) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; }
+}
 
 __global__ void k_gate_up(const unsigned char* __restrict__ wpacked,
                           const unsigned char* __restrict__ wscale,
@@ -200,8 +222,23 @@ static struct {
 static float* d_gu = nullptr;
 static float* d_act = nullptr;
 static float* d_out = nullptr;
+static float* g_h_out = nullptr;
 static hipStream_t g_stream = nullptr;
 static int g_init = 0;
+
+DLLEXPORT void* igpu_hostmalloc(size_t nbytes) {
+    void* h = nullptr;
+    hipError_t rc = hipHostMalloc(&h, nbytes, hipHostMallocMapped);
+    if (rc != hipSuccess) {
+        diag("hostmalloc %zu failed: %d\n", nbytes, (int)rc);
+        return nullptr;
+    }
+    return h;
+}
+
+DLLEXPORT int igpu_hostfree(void* h) {
+    return hipHostFree(h) == hipSuccess ? 0 : -1;
+}
 
 DLLEXPORT int igpu_init(void) {
     if (g_init) return 0;
@@ -210,7 +247,12 @@ DLLEXPORT int igpu_init(void) {
     CHK(hipStreamCreate(&g_stream));
     CHK(hipMalloc(&d_gu, E * GU_ROWS * sizeof(float)));
     CHK(hipMalloc(&d_act, E * INTER * sizeof(float)));
-    CHK(hipMalloc(&d_out, DN_ROWS * sizeof(float)));
+    {   // APU: 输出走 host-mapped 内存，kernel 直接写、宿主直接读，无需 hipMemcpy
+        void* h_out = nullptr;
+        CHK(hipHostMalloc(&h_out, DN_ROWS * sizeof(float), hipHostMallocMapped));
+        { void* dp = nullptr; CHK(hipHostGetDevicePointer(&dp, h_out, 0)); d_out = (float*)dp; }
+        g_h_out = (float*)h_out;
+    }
     memset(g_banks, 0, sizeof(g_banks));
     g_init = 1;
     return 0;
@@ -220,38 +262,98 @@ DLLEXPORT int igpu_register_layer(int layer,
     void* gu_pack, void* gu_scale, void* gu_global,
     void* dn_pack, void* dn_scale, void* dn_global) {
     if (layer < 0 || layer >= MAX_LAYERS) return -1;
-    void *d;
-    hipHostGetDevicePointer(&d, gu_pack, 0);    g_banks[layer].gu_pack  = (const unsigned char*)d;
-    hipHostGetDevicePointer(&d, gu_scale, 0);   g_banks[layer].gu_scale = (const unsigned char*)d;
-    hipHostGetDevicePointer(&d, gu_global, 0);  g_banks[layer].gu_global= (const unsigned short*)d;
-    hipHostGetDevicePointer(&d, dn_pack, 0);    g_banks[layer].dn_pack  = (const unsigned char*)d;
-    hipHostGetDevicePointer(&d, dn_scale, 0);   g_banks[layer].dn_scale = (const unsigned char*)d;
-    hipHostGetDevicePointer(&d, dn_global, 0);  g_banks[layer].dn_global= (const unsigned short*)d;
+    void *d = nullptr;
+    const void* ptrs[6] = {gu_pack, gu_scale, gu_global, dn_pack, dn_scale, dn_global};
+    for (int i = 0; i < 6; i++) {
+        hipError_t rr = hipHostGetDevicePointer(&d, (void*)ptrs[i], 0);
+        if (rr != hipSuccess || !d) {
+            diag("[igpu-dll] register layer %d bank %d: rc=%d dev=%p host=%p\n",
+                    layer, i, (int)rr, d, ptrs[i]);
+            return -8;
+        }
+        switch (i) {
+            case 0: g_banks[layer].gu_pack   = (const unsigned char*)d; break;
+            case 1: g_banks[layer].gu_scale  = (const unsigned char*)d; break;
+            case 2: g_banks[layer].gu_global = (const unsigned short*)d; break;
+            case 3: g_banks[layer].dn_pack   = (const unsigned char*)d; break;
+            case 4: g_banks[layer].dn_scale  = (const unsigned char*)d; break;
+            case 5: g_banks[layer].dn_global = (const unsigned short*)d; break;
+        }
+    }
     return 0;
 }
 
 DLLEXPORT int igpu_moe_decode(int layer,
     const float* hidden, const int* topk_ids, const float* topkw, float* out) {
+    diag("decode: layer=%d g_init=%d hid=%p ids=%p tkw=%p out=%p\n", layer, g_init, (void*)hidden, (void*)topk_ids, (void*)topkw, (void*)out);
     if (!g_init || layer < 0 || layer >= MAX_LAYERS) return -1;
     auto& b = g_banks[layer];
     if (!b.gu_pack) return -2;
-    void *d_hid, *d_tkw, *d_ids;
-    hipHostGetDevicePointer(&d_hid, (void*)hidden, 0);
-    hipHostGetDevicePointer(&d_tkw, (void*)topkw, 0);
-    hipHostGetDevicePointer(&d_ids, (void*)topk_ids, 0);
+    void *d_hid = nullptr, *d_tkw = nullptr, *d_ids = nullptr;
+    hipError_t r1 = hipHostGetDevicePointer(&d_hid, (void*)hidden, 0);
+    hipError_t r2 = hipHostGetDevicePointer(&d_tkw, (void*)topkw, 0);
+    hipError_t r3 = hipHostGetDevicePointer(&d_ids, (void*)topk_ids, 0);
+    if (r1 != hipSuccess || r2 != hipSuccess || r3 != hipSuccess) {
+        diag("[igpu-dll] getdevptr failed: hid=%d tkw=%d ids=%d (host=%p/%p/%p)\n",
+                (int)r1, (int)r2, (int)r3, (void*)hidden, (void*)topkw, (void*)topk_ids);
+        return -5;
+    }
+    if (!d_hid || !d_tkw || !d_ids) {
+        diag("[igpu-dll] null device ptr: hid=%p tkw=%p ids=%p\n", d_hid, d_tkw, d_ids);
+        return -6;
+    }
+    {   // 路由 id 越界防御：越界 id 会让 kernel 读到 bank 外的地址
+        int ids_host[8];
+        memcpy(ids_host, topk_ids, E * sizeof(int));
+        for (int i = 0; i < E; i++) {
+            if (ids_host[i] < 0 || ids_host[i] >= 256) {
+                diag("[igpu-dll] bad topk_ids[%d]=%d\n", i, ids_host[i]);
+                return -7;
+            }
+        }
+    }
+    diag("ids bounds ok\n");
+    {
+        const unsigned char* p0 = (const unsigned char*)b.gu_pack;
+        diag("host view bank bytes = %d %d %d %d (dev alias %p)\n", (int)p0[0], (int)p0[1], (int)p0[2], (int)p0[3], (void*)b.gu_pack);
+    }
     CHK(hipMemsetAsync(d_out, 0, DN_ROWS * sizeof(float), g_stream));
+    diag("memset ok\n");
+    diag("launch gu: pack=%p scale=%p glob=%p\n", (void*)b.gu_pack, (void*)b.gu_scale, (void*)b.gu_global);
     hipLaunchKernelGGL(k_gate_up, dim3(E * (GU_ROWS / GU_RPB)), dim3(GU_BLOCK), 0, g_stream,
                        b.gu_pack, b.gu_scale, b.gu_global, (const float*)d_hid, (const int*)d_ids, d_gu);
+    diag("gu launched\n");
     hipLaunchKernelGGL(k_act, dim3((E * INTER) / 256), dim3(256), 0, g_stream, d_gu, d_act);
+    diag("act launched\n");
     hipLaunchKernelGGL(k_down, dim3(E * (DN_ROWS / DN_RPB)), dim3(DN_BLOCK), 0, g_stream,
                        b.dn_pack, b.dn_scale, b.dn_global, d_act, (const float*)d_tkw, (const int*)d_ids, d_out);
+    diag("down launched\n");
     hipError_t le = hipGetLastError();
-    if (le != hipSuccess) { fprintf(stderr, "launch err: %s\n", hipGetErrorString(le)); return -3; }
+    if (le != hipSuccess) { diag("launch err: %s\n", hipGetErrorString(le)); return -3; }
+    {
+        float saved[4];
+        hipMemcpy(saved, d_out, 16, hipMemcpyDeviceToHost);
+        hipLaunchKernelGGL(k_probe, dim3(1), dim3(1), 0, g_stream, (const float*)d_hid, d_out);
+        hipStreamSynchronize(g_stream);
+        float probe[4];
+        hipMemcpy(probe, d_out, 16, hipMemcpyDeviceToHost);
+        diag("kernel probe hidden[0..3] = %.6g %.6g %.6g %.6g\n", probe[0], probe[1], probe[2], probe[3]);
+        hipMemcpy(d_out, saved, 16, hipMemcpyHostToDevice);
+        {
+            float pb[5];
+            hipLaunchKernelGGL(k_probe_bank, dim3(1), dim3(1), 0, g_stream, b.gu_pack, b.gu_global, d_out);
+            hipStreamSynchronize(g_stream);
+            hipMemcpy(pb, d_out, 20, hipMemcpyDeviceToHost);
+            diag("kernel probe bank bytes = %.0f %.0f %.0f %.0f glob=%.0f\n", pb[0], pb[1], pb[2], pb[3], pb[4]);
+        }
+    }
     CHK(hipStreamSynchronize(g_stream));
-    CHK(hipMemcpy(out, d_out, DN_ROWS * sizeof(float), hipMemcpyDeviceToHost));
+    diag("sync ok\n");
+    memcpy(out, g_h_out, DN_ROWS * sizeof(float));
+    diag("memcpy ok\n");
     return 0;
 }
 
 DLLEXPORT const char* igpu_version(void) {
-    return "P1b hip_moe_dll v2 (gfx1103, NVFP4, E=8, topk_ids routing)";
+    return "P1b hip_moe_dll v7-bankprobe (gfx1103, NVFP4, E=8, topk_ids routing)";
 }

@@ -153,6 +153,10 @@ class GraphRunner:
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
+        if os.environ.get("FT_SKIP_CUDA_GRAPH"):
+            self.graph_bs_list = []
+            self.max_graph_bs = 0
+            return logger.info_rank0("CUDA graph capture skipped (FT_SKIP_CUDA_GRAPH).")
 
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
 
