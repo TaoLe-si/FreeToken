@@ -112,7 +112,7 @@ __device__ static inline float dot_chunk_f4(const float4 chunk,
 // gate_up GEMV (tuned): block = 8 rows x 32 lanes; each lane reads TWO float4
 // chunks (32B in flight, codes k = 32*lane .. 32*lane+31 and +512 bytes later),
 // widening per-thread memory-level parallelism for the zero-copy PCIe read.
-static const int GU_RPB = 8, GU_TPR = 32, GU_CPL = 2, GU_BLOCK = GU_RPB * GU_TPR;
+static const int GU_RPB = 8, GU_TPR = 16, GU_CPL = 4, GU_BLOCK = GU_RPB * GU_TPR;
 
 __global__ void k_gate_up(const unsigned char* __restrict__ wpacked,
                           const unsigned char* __restrict__ wscale,
@@ -165,7 +165,7 @@ __global__ void k_act(const float* __restrict__ gu, float* __restrict__ act) {
 // down GEMV + routed-weight accumulate (tuned): block = 8 rows x 8 lanes;
 // each lane reads TWO float4 chunks (K=512 -> 256B = 16 chunks/row; lanes 0..7,
 // chunks lane and lane+8). Small blocks -> many blocks -> deep queue.
-static const int DN_RPB = 8, DN_TPR = 8, DN_CPL = 2, DN_BLOCK = DN_RPB * DN_TPR;
+static const int DN_RPB = 4, DN_TPR = 8, DN_CPL = 2, DN_BLOCK = DN_RPB * DN_TPR;
 
 __global__ void k_down(const unsigned char* __restrict__ wpacked,
                        const unsigned char* __restrict__ wscale,
