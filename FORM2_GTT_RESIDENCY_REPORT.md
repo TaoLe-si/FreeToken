@@ -113,8 +113,12 @@ zero-copy 路线已死（见 IGPU_ZEROCOPY_VERDICT.md）。用户问：不走 ze
 1. **prefill 路径硬依赖 CUDA pinned banks**：pageable banks 下 `copy_missing` →
    `fast_index_copy` 崩溃（"host tensor must be pinned+mapped"）。因此形态二若做
    跨进程版，引擎侧 banks 必须保持 PINNED（prefill 用），GTT 副本由 worker 进程独享。
-2. **同夜 0.48 t/s 为机体深夜限频**（与 DELIVERY_2026-0901.md 第 67 行记录一致：
-   深夜 0.6-1.5 t/s，清晨冷启动恢复 2.4-2.8 t/s），非代码回归。输出正确性完好
-   （reasoning_content 正常生成，finish_reason=length 正常）。
+2. **同夜 0.48 t/s 的直接原因是显存预算耗尽，不是深夜限频**。原始日志明确记录：
+   初始化前可用显存 **6.89 GiB**，初始化后仅 **0.09 GiB**；`memory_ratio=0.90`、
+   KV/cache 与模型初始化共同吃满了显存，导致解码严重退化。后续清理全部旧 Python
+   进程并将启动参数改为 `--memory-ratio 0.65 --kv-reserve-tokens 4096
+   --max-running-requests 1` 后，初始化后恢复到 **2.19 GiB**，短请求耗时从约
+   2 秒/token 降至约 **1.4 秒/token**。原先将该现象归因为夜间热/功耗限频是错误判断，
+   已撤回。输出内容本身正常（思考模型内容位于 `reasoning_content`）。
 3. 引擎最终稳定形态：`--moe-backend igpu` + 自动 CPU fallback（pinned banks），
    可安全过夜运行。
