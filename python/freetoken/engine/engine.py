@@ -1324,18 +1324,16 @@ class Engine:
                 if (
                     not is_verify
                     and not os.environ.get("FT_DISABLE_DECODE_REPLAY")  # replay default-on; opt-out for debug
-                    # 2026-09-01 (final): decode replay stays OFF under MTP with the
-                    # offload MoE slot cache. Root cause is NOT output-buffer aliasing
-                    # (cloning logits/prev_hidden/all_hidden below did not fix it) but
-                    # Bug A from DELIVERY_2026-0901.md: copy_missing's DMA/LRU slot
-                    # plan is host-driven per eager step; a replay freezes the capture-
-                    # time plan, so every decode step with an expert-cache miss reads
-                    # the WRONG expert weights. The slot cache is one flat (layer,
-                    # expert) pool (cache_size 868 << 40 layers x 256 experts), so
-                    # decode misses are the norm -> replay is structurally unsafe
-                    # until decode either pins whole layers (prefill_overlap style)
-                    # or runs on the cpu/igpu executors that bypass the slot cache.
-                    and not getattr(self.config, "mtp", False)
+                    # 2026-09-01: decode replay is safe ONLY when the MoE decode path
+                    # does not depend on copy_missing's host-driven LRU/DMA plan
+                    # (DELIVERY Bug A: a replay freezes the capture-time slot plan, so
+                    # slot-cache misses read the WRONG expert weights). The CPU
+                    # executor (decode_target="cpu") ships routing through pinned
+                    # buffers + graph host nodes, so the replay re-reads THIS step's
+                    # routing -> fully capturable. slot-cache paths (gpu/hybrid) keep
+                    # replay off under MTP.
+                    and (not getattr(self.config, "mtp", False)
+                         or getattr(self, "cpu_moe_executor", None) is not None)
                     and self.graph_runner.can_use_cuda_graph(batch)
                     and getattr(self.graph_runner, "_captures_hidden", False)
                 ):
