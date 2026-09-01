@@ -64,30 +64,43 @@ function loadSettings(){
   return Promise.resolve();
 }
 function _persistSettings(obj){
-  /* 跨 session 稳定持久：优先 pywebview.js_api 落 JSON 文件，fallback localStorage */
-  try {
-    if(window.pywebview && window.pywebview.api && window.pywebview.api.set_settings){
-      /* js_api 同样返回 Promise：返回值恒为 truthy，须等 Promise resolve 后
-         才能确认成功/失败，否则会误判成功。fire-and-forget 即可，但要把
-         Promise 传给后端前序列化成纯对象（settings 本身就是纯对象）。 */
-      window.pywebview.api.set_settings(JSON.parse(JSON.stringify(obj)))
-        .then(function(ok){ if(ok === false) { /* 落盘失败，兜底 localStorage */ try { localStorage.setItem(SET_KEY, JSON.stringify(obj)); } catch(_e2){} } })
-        .catch(function(){ try { localStorage.setItem(SET_KEY, JSON.stringify(obj)); } catch(_e2){} });
-      return true;
-    }
-  } catch(_e){}
-  try { localStorage.setItem(SET_KEY, JSON.stringify(obj)); return true; } catch(_e){}
-  return false;
+  /* 跨 session 稳定持久：优先 pywebview.js_api 落 JSON 文件，fallback localStorage。
+     若 bridge 尚未注入，先等最多 3s（与读取路径对称），再决定落盘目标。 */
+  var payload = JSON.stringify(obj);
+  var writeLocal = function(){ try { localStorage.setItem(SET_KEY, payload); return true; } catch(_e2){ return false; } };
+  return _waitForPywebview(3000).then(function(ready){
+    if(!ready) return writeLocal();
+    try {
+      if(window.pywebview && window.pywebview.api && window.pywebview.api.set_settings){
+        return window.pywebview.api.set_settings(JSON.parse(payload))
+          .then(function(ok){ if(ok === false) return writeLocal(); return true; })
+          .catch(function(){ return writeLocal(); });
+      }
+    } catch(_e){}
+    return writeLocal();
+  });
+}
+function _waitForPywebview(timeoutMs){
+  return new Promise(function(resolve){
+    var t0 = Date.now();
+    (function poll(){
+      try {
+        if(window.pywebview && window.pywebview.api && window.pywebview.api.get_settings) return resolve(true);
+      } catch(_e){}
+      if(Date.now() - t0 >= (timeoutMs || 3000)) return resolve(false);
+      setTimeout(poll, 50);
+    })();
+  });
 }
 function _loadPersistedSettings(){
-  /* 跨 session 读取：优先 pywebview.js_api，fallback localStorage。
-     pywebview js_api 返回 Promise —— 必须 return 它，由 loadSettings await。 */
-  try {
-    if(window.pywebview && window.pywebview.api && window.pywebview.api.get_settings){
-      return Promise.resolve(window.pywebview.api.get_settings());
+  /* pywebview js_api 在页面加载后异步注入；脚本启动时往往尚不存在。
+     先等待注入（最多 3s），再走 js_api 读取；超时才退回 localStorage。 */
+  return _waitForPywebview(3000).then(function(ready){
+    if(ready){
+      try { return Promise.resolve(window.pywebview.api.get_settings()); } catch(_e){}
     }
-  } catch(_e){}
-  try { return JSON.parse(localStorage.getItem(SET_KEY) || "{}"); } catch(_e){ return {}; }
+    try { return JSON.parse(localStorage.getItem(SET_KEY) || "{}"); } catch(_e){ return {}; }
+  });
 }
 function saveSettings(){
   var ids = Object.keys(settings);
