@@ -448,6 +448,7 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        self.igpu_shared_executor = None
         if is_offload_moe_backend(config.moe_backend):
             self._init_offload_moe_cache(config)
         # Dense FFN B-group offload: init iGPU executor if configured
@@ -815,7 +816,7 @@ class Engine:
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
         if cache.decode_target == "igpu":
-            self._init_igpu_executor(config, cache, layers)
+            self._init_igpu_shared_executor(config, cache, layers)
         elif cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
@@ -885,6 +886,56 @@ class Engine:
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
+
+    def _init_igpu_shared_executor(self, config: EngineConfig, cache, layers) -> None:
+        """Build the shared-pool iGPU executor (P2): the ROCm HIP DLL computes the
+        NVFP4 expert GEMVs on the Radeon 780M, reading the cache's pinned host
+        banks zero-copy (hipHostRegister + hipHostGetDevicePointer inside the
+        DLL).
+
+        self.cpu_moe_executor stays None on purpose: the old replay gate keys on
+        it, and this path has its own gate clause (igpu_shared_executor). On any
+        failure falls back to the CPU executor when config.igpu_fallback is set,
+        else raises.
+        """
+        from freetoken.moe.igpu_shared_executor import IgpuSharedMoeExecutor
+
+        sample = layers[0]
+        if not all(hasattr(sample, attr) for attr in ("top_k",)):
+            raise NotImplementedError(
+                "iGPU shared MoE backend is not yet supported for this model "
+                "architecture (MoE layer is missing top_k)."
+            )
+        if cache.quant_format != "nvfp4":
+            if config.igpu_fallback:
+                logger.warning_rank0(
+                    f"iGPU shared MoE backend supports native nvfp4 banks only, got "
+                    f"{cache.quant_format!r}; falling back to the CPU executor"
+                )
+                return self._init_cpu_moe_executor(config, cache, layers)
+            raise NotImplementedError(
+                f"iGPU shared MoE backend supports native nvfp4 banks only, got "
+                f"{cache.quant_format!r}; use --moe-backend cpu or offload."
+            )
+        try:
+            executor = IgpuSharedMoeExecutor(
+                cache,
+                self.device,
+                num_layers=cache.num_layers,
+                num_experts=cache.num_experts,
+                top_k=getattr(sample, "top_k", 8),
+            )
+            executor.register_banks()
+        except (OSError, RuntimeError, NotImplementedError) as exc:
+            if config.igpu_fallback:
+                logger.warning_rank0(
+                    f"iGPU shared MoE executor unavailable ({exc}); falling back "
+                    "to the CPU executor for decode"
+                )
+                return self._init_cpu_moe_executor(config, cache, layers)
+            raise
+        cache.set_igpu_shared_executor(executor)
+        self.igpu_shared_executor = executor
 
     def _init_igpu_executor(self, config: EngineConfig, cache, layers) -> None:
         """Build the iGPU D3D12 executor (decode-time expert compute on the iGPU).
@@ -1333,7 +1384,8 @@ class Engine:
                     # routing -> fully capturable. slot-cache paths (gpu/hybrid) keep
                     # replay off under MTP.
                     and (not getattr(self.config, "mtp", False)
-                         or getattr(self, "cpu_moe_executor", None) is not None)
+                         or getattr(self, "cpu_moe_executor", None) is not None
+                         or getattr(self, "igpu_shared_executor", None) is not None)
                     and self.graph_runner.can_use_cuda_graph(batch)
                     and getattr(self.graph_runner, "_captures_hidden", False)
                 ):

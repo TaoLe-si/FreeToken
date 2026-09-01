@@ -143,6 +143,9 @@ class OffloadMoeCache:
         # "igpu" (IgpuMoeExecutor); None for the GPU decode path.
         self.cpu_executor = None
         self.igpu_executor = None
+        # Shared-pool iGPU executor (IgpuSharedMoeExecutor over the ROCm HIP
+        # DLL): reads these same pinned banks zero-copy via hipHostRegister.
+        self.igpu_shared_executor = None
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-backend cpu case).
@@ -508,6 +511,25 @@ class OffloadMoeCache:
             "set_igpu_executor requires decode_target == 'igpu'"
         )
         self.igpu_executor = executor
+
+    def set_igpu_shared_executor(self, executor) -> None:
+        """Attach the shared-pool iGPU (HIP DLL) executor (decode_target == "igpu").
+
+        Unlike the D3D12 executor this one registers the cache's pinned
+        bank_sources with the ROCm runtime (hipHostRegister) so the iGPU reads
+        the SAME host banks zero-copy; set_igpu_executor's service-process path
+        stays available for the old numpy/D3D12 route.
+        """
+        assert self.decode_target == "igpu", (
+            "set_igpu_shared_executor requires decode_target == 'igpu'"
+        )
+        self.igpu_shared_executor = executor
+
+    def is_igpu_shared_layer(self, layer_id: int) -> bool:
+        """Whether ``layer_id`` decodes on the shared-pool iGPU (HIP DLL) executor.
+        True for every MoE layer while the executor is attached (all MoE layers
+        route to the iGPU in this mode)."""
+        return self.igpu_shared_executor is not None
 
     def is_cpu_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""

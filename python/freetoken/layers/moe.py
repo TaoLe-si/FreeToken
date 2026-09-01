@@ -309,6 +309,12 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        # Shared-pool iGPU (HIP DLL) route: the iGPU reads the pinned banks
+        # zero-copy, so nothing here touches the GPU slot cache either.
+        if cache.is_igpu_shared_layer(self.layer_id):
+            executor = cache.igpu_shared_executor
+            assert executor is not None, "iGPU shared MoE executor was not initialized"
+            return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
