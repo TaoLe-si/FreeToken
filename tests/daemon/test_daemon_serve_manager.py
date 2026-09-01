@@ -81,7 +81,6 @@ def make_manager(
     *,
     signal_fn=None,
     grace_s=0.2,
-    auto_restart=False,
     adopt_fn=None,
     prepare_stop=None,
     read_stats=lambda port: {
@@ -105,7 +104,6 @@ def make_manager(
         grace_s=grace_s,
         reap_wait_s=reap_wait_s,
         apply_oom=False,
-        auto_restart=auto_restart,
         prepare_stop=prepare_stop,
         read_stats=read_stats,
         accounting_outbox=accounting_outbox,
@@ -478,7 +476,7 @@ def test_crash_during_failed_prepare_still_persists_receipt_and_never_restarts(t
         raise AccountingPrepareError("connection lost")
 
     mgr, _, _ = make_manager(
-        tmp_path, sp, prepare_stop=prepare, auto_restart=True
+        tmp_path, sp, prepare_stop=prepare
     )
     mgr.start("m", 1919, [])
     with pytest.raises(AccountingPrepareError, match="connection lost"):
@@ -499,7 +497,7 @@ def test_prepare_failure_keeps_stop_latch_for_a_later_crash(tmp_path):
         raise AccountingPrepareError("outbox unavailable")
 
     mgr, _, _ = make_manager(
-        tmp_path, sp, prepare_stop=prepare, auto_restart=True
+        tmp_path, sp, prepare_stop=prepare
     )
     started = mgr.start("m", 1919, [])
     with pytest.raises(AccountingPrepareError, match="outbox unavailable"):
@@ -512,14 +510,16 @@ def test_prepare_failure_keeps_stop_latch_for_a_later_crash(tmp_path):
     assert len(sp.calls) == 1
 
 
-def test_auto_restart_on_crash(tmp_path):
+def test_no_auto_restart_on_crash(tmp_path):
     sp = Spawner()
-    mgr, _, _ = make_manager(tmp_path, sp, auto_restart=True)
+    mgr, _, _ = make_manager(tmp_path, sp)
     r1 = mgr.start("m", 1919, [])
     sp.by_pid(r1["pid"]).die(1, "exited")
-    # A new serve should come up automatically.
-    assert wait_until(lambda: mgr.status()["running"] and mgr.status()["pid"] != r1["pid"])
-    assert len(sp.calls) == 2
+    # Auto-restart was removed: a crashed serve stays down until an explicit start.
+    assert wait_until(lambda: mgr.status()["running"] is False)
+    time.sleep(0.3)  # would-be restart window
+    assert mgr.status()["running"] is False
+    assert len(sp.calls) == 1  # no respawn happened
 
 
 # --------------------------------------------------------------------------- switch
@@ -550,18 +550,18 @@ def test_stop_during_inflight_start_stops_the_new_serve(tmp_path):
     assert wait_until(lambda: mgr.status()["running"] is False)  # new serve was stopped, not left up
 
 
-def test_auto_restart_does_not_resurrect_after_user_stop(tmp_path):
+def test_internal_auto_start_after_user_stop_aborts(tmp_path):
     sp = Spawner()
 
     def sig(pid, s):
         if s == signal.SIGTERM:
             sp.by_pid(pid).die(0)
 
-    mgr, _, _ = make_manager(tmp_path, sp, signal_fn=sig, auto_restart=True)
+    mgr, _, _ = make_manager(tmp_path, sp, signal_fn=sig)
     mgr.start("m", 1919, [])
     mgr.stop()  # user stop → latches _stop_requested
     assert wait_until(lambda: mgr.status()["running"] is False)
-    # An auto-restart attempt now must abort (the user asked for the engine to be down).
+    # Any internal (_auto) start attempt must abort (the user asked for the engine down).
     assert mgr.start("m", 1919, [], _auto=True) == {"pid": None, "aborted": True}
     assert len(sp.calls) == 1  # no respawn
     # An explicit client start clears the stop intent and runs again.

@@ -23,6 +23,8 @@ from .api_models import (
 from .function_call_parser import ToolCallItem
 from .request_logger import log_request
 from .generation import (
+    KEEPALIVE,
+    with_keepalive,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -42,6 +44,10 @@ from .generation import (
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
 _ACCEPTED_EFFORTS = (*KNOWN_REASONING_EFFORTS, "off")
+
+# Emit an SSE comment keepalive frame after this many seconds of stream silence,
+# bridging long queue/prefill/decode gaps for clients with stream-idle timeouts.
+KEEPALIVE_INTERVAL_S = 15.0
 
 
 def _thinking_type(req: Any) -> str | None:
@@ -250,7 +256,13 @@ async def stream_chat_completion_chunks(
     cached_tokens = 0
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
-    events = generate_events(uid, spec, state, source="/v1/chat/completions")
+    # Interleave keepalives during queue/prefill/decode silence. The keepalive is emitted
+    # as an SSE comment line (": ping\n\n"), not a data chunk, so [OI] parsers ignore it
+    # while proxies/load balancers with idle timeouts keep the connection open.
+    events = with_keepalive(
+        generate_events(uid, spec, state, source="/v1/chat/completions"),
+        KEEPALIVE_INTERVAL_S,
+    )
     while True:
         try:
             ev = await events.__anext__()
@@ -263,6 +275,10 @@ async def stream_chat_completion_chunks(
                 {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
             )
             break
+        if ev is KEEPALIVE:
+            # SSE comment frame — ignored by [OI] data-chunk parsers, still resets idle timers.
+            yield b": ping\n\n"
+            continue
         if isinstance(ev, ReasoningDelta):
             yield _sse(
                 _chat_chunk(

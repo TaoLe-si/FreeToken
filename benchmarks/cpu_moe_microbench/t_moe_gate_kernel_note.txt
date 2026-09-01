@@ -1,0 +1,4 @@
+// [P1d] MXFP4 GEMV kernel for MoE gate: 256 experts, K=2048 inputs, N=512 outputs
+// Same shader as t_mxfp4_gemv_sk.dxil - just M=256 N=512 K=2048
+// This file is just a placeholder - we already have t_mxfp4_gemv_sk.dxil from [P1b]
+// and the kernel supports any M, K (M=256 N=512 K=2048 fits naturally).

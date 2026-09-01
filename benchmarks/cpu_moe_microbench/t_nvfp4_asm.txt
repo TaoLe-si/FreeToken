@@ -1,0 +1,610 @@
+;
+; Input signature:
+;
+; Name                 Index   Mask Register SysValue  Format   Used
+; -------------------- ----- ------ -------- -------- ------- ------
+; no parameters
+;
+; Output signature:
+;
+; Name                 Index   Mask Register SysValue  Format   Used
+; -------------------- ----- ------ -------- -------- ------- ------
+; no parameters
+; shader hash: 550b4aa16b4fb9b98168c046e9f4c0eb
+;
+; Pipeline Runtime Information: 
+;
+;PSVRuntimeInfo:
+; Compute Shader
+; NumThreads=(256,1,1)
+; MinimumExpectedWaveLaneCount: 0
+; MaximumExpectedWaveLaneCount: 4294967295
+; UsesViewID: false
+; SigInputElements: 0
+; SigOutputElements: 0
+; SigPatchConstOrPrimElements: 0
+; SigInputVectors: 0
+; SigOutputVectors[0]: 0
+; SigOutputVectors[1]: 0
+; SigOutputVectors[2]: 0
+; SigOutputVectors[3]: 0
+; EntryFunctionName: main
+;
+;
+; Buffer Definitions:
+;
+; cbuffer P
+; {
+;
+;   struct P
+;   {
+;
+;       uint K;                                       ; Offset:    0
+;       uint nbPerRow;                                ; Offset:    4
+;       uint nsPerRow;                                ; Offset:    8
+;       uint pad;                                     ; Offset:   12
+;   
+;   } P;                                              ; Offset:    0 Size:    16
+;
+; }
+;
+; Resource bind info for packed
+; {
+;
+;   uint $Element;                                    ; Offset:    0 Size:     4
+;
+; }
+;
+; Resource bind info for scl
+; {
+;
+;   float $Element;                                   ; Offset:    0 Size:     4
+;
+; }
+;
+; Resource bind info for bias
+; {
+;
+;   float $Element;                                   ; Offset:    0 Size:     4
+;
+; }
+;
+; Resource bind info for act
+; {
+;
+;   float $Element;                                   ; Offset:    0 Size:     4
+;
+; }
+;
+; Resource bind info for gbl
+; {
+;
+;   float $Element;                                   ; Offset:    0 Size:     4
+;
+; }
+;
+; Resource bind info for rowBias
+; {
+;
+;   float $Element;                                   ; Offset:    0 Size:     4
+;
+; }
+;
+; Resource bind info for outv
+; {
+;
+;   float $Element;                                   ; Offset:    0 Size:     4
+;
+; }
+;
+;
+; Resource Bindings:
+;
+; Name                                 Type  Format         Dim      ID      HLSL Bind  Count
+; ------------------------------ ---------- ------- ----------- ------- -------------- ------
+; P                                 cbuffer      NA          NA     CB0            cb0     1
+; packed                            texture  struct         r/o      T0             t0     1
+; scl                               texture  struct         r/o      T1             t1     1
+; bias                              texture  struct         r/o      T2             t2     1
+; act                               texture  struct         r/o      T3             t3     1
+; gbl                               texture  struct         r/o      T4             t4     1
+; rowBias                           texture  struct         r/o      T5             t5     1
+; outv                                  UAV  struct         r/w      U0             u0     1
+;
+target datalayout = "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64"
+target triple = "dxil-ms-dx"
+
+%dx.types.Handle = type { i8* }
+%dx.types.CBufRet.i32 = type { i32, i32, i32, i32 }
+%dx.types.ResRet.f32 = type { float, float, float, float, i32 }
+%dx.types.ResRet.i32 = type { i32, i32, i32, i32, i32 }
+%"class.StructuredBuffer<unsigned int>" = type { i32 }
+%"class.StructuredBuffer<float>" = type { float }
+%"class.RWStructuredBuffer<float>" = type { float }
+%P = type { i32, i32, i32, i32 }
+
+@kE2M1 = internal unnamed_addr constant [16 x i32] [i32 0, i32 1, i32 2, i32 3, i32 4, i32 6, i32 8, i32 12, i32 0, i32 -1, i32 -2, i32 -3, i32 -4, i32 -6, i32 -8, i32 -12], align 4
+@"\01?sh@@3PAMA" = external addrspace(3) global [256 x float], align 4
+
+define void @main() {
+  %1 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 1, i32 0, i32 0, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %2 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 0, i32 5, i32 5, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %3 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 0, i32 4, i32 4, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %4 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 0, i32 3, i32 3, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %5 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 0, i32 2, i32 2, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %6 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 0, i32 1, i32 1, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %7 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 0, i32 0, i32 0, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %8 = call %dx.types.Handle @dx.op.createHandle(i32 57, i8 2, i32 0, i32 0, i1 false)  ; CreateHandle(resourceClass,rangeId,index,nonUniformIndex)
+  %9 = call i32 @dx.op.flattenedThreadIdInGroup.i32(i32 96)  ; FlattenedThreadIdInGroup()
+  %10 = call i32 @dx.op.groupId.i32(i32 94, i32 0)  ; GroupId(component)
+  %11 = icmp ugt i32 %10, 2047
+  br i1 %11, label %389, label %12
+
+; <label>:12                                      ; preds = %0
+  %13 = call %dx.types.CBufRet.i32 @dx.op.cbufferLoadLegacy.i32(i32 59, %dx.types.Handle %8, i32 0)  ; CBufferLoadLegacy(handle,regIndex)
+  %14 = extractvalue %dx.types.CBufRet.i32 %13, 0
+  %15 = lshr i32 %14, 5
+  %16 = icmp ult i32 %9, %15
+  br i1 %16, label %17, label %364
+
+; <label>:17                                      ; preds = %12
+  br label %18
+
+; <label>:18                                      ; preds = %18, %17
+  %19 = phi float [ %357, %18 ], [ 0.000000e+00, %17 ]
+  %20 = phi i32 [ %358, %18 ], [ %9, %17 ]
+  %21 = call %dx.types.CBufRet.i32 @dx.op.cbufferLoadLegacy.i32(i32 59, %dx.types.Handle %8, i32 0)  ; CBufferLoadLegacy(handle,regIndex)
+  %22 = extractvalue %dx.types.CBufRet.i32 %21, 2
+  %23 = mul i32 %22, %10
+  %24 = add i32 %23, %20
+  %25 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %6, i32 %24, i32 0)  ; BufferLoad(srv,index,wot)
+  %26 = extractvalue %dx.types.ResRet.f32 %25, 0
+  %27 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %5, i32 %24, i32 0)  ; BufferLoad(srv,index,wot)
+  %28 = extractvalue %dx.types.ResRet.f32 %27, 0
+  %29 = extractvalue %dx.types.CBufRet.i32 %21, 1
+  %30 = mul i32 %29, %10
+  %31 = shl i32 %20, 2
+  %32 = add i32 %30, %31
+  %33 = call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %7, i32 %32, i32 0)  ; BufferLoad(srv,index,wot)
+  %34 = extractvalue %dx.types.ResRet.i32 %33, 0
+  %35 = add i32 %32, 1
+  %36 = call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %7, i32 %35, i32 0)  ; BufferLoad(srv,index,wot)
+  %37 = extractvalue %dx.types.ResRet.i32 %36, 0
+  %38 = add i32 %32, 2
+  %39 = call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %7, i32 %38, i32 0)  ; BufferLoad(srv,index,wot)
+  %40 = extractvalue %dx.types.ResRet.i32 %39, 0
+  %41 = add i32 %32, 3
+  %42 = call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %7, i32 %41, i32 0)  ; BufferLoad(srv,index,wot)
+  %43 = extractvalue %dx.types.ResRet.i32 %42, 0
+  %44 = shl i32 %20, 5
+  %45 = and i32 %34, 15
+  %46 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %45
+  %47 = load i32, i32* %46, align 4, !tbaa !20
+  %48 = sitofp i32 %47 to float
+  %49 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %44, i32 0)  ; BufferLoad(srv,index,wot)
+  %50 = extractvalue %dx.types.ResRet.f32 %49, 0
+  %51 = fmul fast float %50, %48
+  %52 = lshr i32 %34, 4
+  %53 = and i32 %52, 15
+  %54 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %53
+  %55 = load i32, i32* %54, align 4, !tbaa !20
+  %56 = sitofp i32 %55 to float
+  %57 = or i32 %44, 1
+  %58 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %57, i32 0)  ; BufferLoad(srv,index,wot)
+  %59 = extractvalue %dx.types.ResRet.f32 %58, 0
+  %60 = fmul fast float %59, %56
+  %61 = lshr i32 %34, 8
+  %62 = and i32 %61, 15
+  %63 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %62
+  %64 = load i32, i32* %63, align 4, !tbaa !20
+  %65 = sitofp i32 %64 to float
+  %66 = or i32 %44, 2
+  %67 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %66, i32 0)  ; BufferLoad(srv,index,wot)
+  %68 = extractvalue %dx.types.ResRet.f32 %67, 0
+  %69 = fmul fast float %68, %65
+  %70 = lshr i32 %34, 12
+  %71 = and i32 %70, 15
+  %72 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %71
+  %73 = load i32, i32* %72, align 4, !tbaa !20
+  %74 = sitofp i32 %73 to float
+  %75 = or i32 %44, 3
+  %76 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %75, i32 0)  ; BufferLoad(srv,index,wot)
+  %77 = extractvalue %dx.types.ResRet.f32 %76, 0
+  %78 = fmul fast float %77, %74
+  %79 = lshr i32 %34, 16
+  %80 = and i32 %79, 15
+  %81 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %80
+  %82 = load i32, i32* %81, align 4, !tbaa !20
+  %83 = sitofp i32 %82 to float
+  %84 = or i32 %44, 4
+  %85 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %84, i32 0)  ; BufferLoad(srv,index,wot)
+  %86 = extractvalue %dx.types.ResRet.f32 %85, 0
+  %87 = fmul fast float %86, %83
+  %88 = lshr i32 %34, 20
+  %89 = and i32 %88, 15
+  %90 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %89
+  %91 = load i32, i32* %90, align 4, !tbaa !20
+  %92 = sitofp i32 %91 to float
+  %93 = or i32 %44, 5
+  %94 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %93, i32 0)  ; BufferLoad(srv,index,wot)
+  %95 = extractvalue %dx.types.ResRet.f32 %94, 0
+  %96 = fmul fast float %95, %92
+  %97 = lshr i32 %34, 24
+  %98 = and i32 %97, 15
+  %99 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %98
+  %100 = load i32, i32* %99, align 4, !tbaa !20
+  %101 = sitofp i32 %100 to float
+  %102 = or i32 %44, 6
+  %103 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %102, i32 0)  ; BufferLoad(srv,index,wot)
+  %104 = extractvalue %dx.types.ResRet.f32 %103, 0
+  %105 = fmul fast float %104, %101
+  %106 = lshr i32 %34, 28
+  %107 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %106
+  %108 = load i32, i32* %107, align 4, !tbaa !20
+  %109 = sitofp i32 %108 to float
+  %110 = or i32 %44, 7
+  %111 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %110, i32 0)  ; BufferLoad(srv,index,wot)
+  %112 = extractvalue %dx.types.ResRet.f32 %111, 0
+  %113 = fmul fast float %112, %109
+  %114 = and i32 %37, 15
+  %115 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %114
+  %116 = load i32, i32* %115, align 4, !tbaa !20
+  %117 = sitofp i32 %116 to float
+  %118 = or i32 %44, 8
+  %119 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %118, i32 0)  ; BufferLoad(srv,index,wot)
+  %120 = extractvalue %dx.types.ResRet.f32 %119, 0
+  %121 = fmul fast float %120, %117
+  %122 = lshr i32 %37, 4
+  %123 = and i32 %122, 15
+  %124 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %123
+  %125 = load i32, i32* %124, align 4, !tbaa !20
+  %126 = sitofp i32 %125 to float
+  %127 = or i32 %44, 9
+  %128 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %127, i32 0)  ; BufferLoad(srv,index,wot)
+  %129 = extractvalue %dx.types.ResRet.f32 %128, 0
+  %130 = fmul fast float %129, %126
+  %131 = lshr i32 %37, 8
+  %132 = and i32 %131, 15
+  %133 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %132
+  %134 = load i32, i32* %133, align 4, !tbaa !20
+  %135 = sitofp i32 %134 to float
+  %136 = or i32 %44, 10
+  %137 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %136, i32 0)  ; BufferLoad(srv,index,wot)
+  %138 = extractvalue %dx.types.ResRet.f32 %137, 0
+  %139 = fmul fast float %138, %135
+  %140 = lshr i32 %37, 12
+  %141 = and i32 %140, 15
+  %142 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %141
+  %143 = load i32, i32* %142, align 4, !tbaa !20
+  %144 = sitofp i32 %143 to float
+  %145 = or i32 %44, 11
+  %146 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %145, i32 0)  ; BufferLoad(srv,index,wot)
+  %147 = extractvalue %dx.types.ResRet.f32 %146, 0
+  %148 = fmul fast float %147, %144
+  %149 = lshr i32 %37, 16
+  %150 = and i32 %149, 15
+  %151 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %150
+  %152 = load i32, i32* %151, align 4, !tbaa !20
+  %153 = sitofp i32 %152 to float
+  %154 = or i32 %44, 12
+  %155 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %154, i32 0)  ; BufferLoad(srv,index,wot)
+  %156 = extractvalue %dx.types.ResRet.f32 %155, 0
+  %157 = fmul fast float %156, %153
+  %158 = lshr i32 %37, 20
+  %159 = and i32 %158, 15
+  %160 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %159
+  %161 = load i32, i32* %160, align 4, !tbaa !20
+  %162 = sitofp i32 %161 to float
+  %163 = or i32 %44, 13
+  %164 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %163, i32 0)  ; BufferLoad(srv,index,wot)
+  %165 = extractvalue %dx.types.ResRet.f32 %164, 0
+  %166 = fmul fast float %165, %162
+  %167 = lshr i32 %37, 24
+  %168 = and i32 %167, 15
+  %169 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %168
+  %170 = load i32, i32* %169, align 4, !tbaa !20
+  %171 = sitofp i32 %170 to float
+  %172 = or i32 %44, 14
+  %173 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %172, i32 0)  ; BufferLoad(srv,index,wot)
+  %174 = extractvalue %dx.types.ResRet.f32 %173, 0
+  %175 = fmul fast float %174, %171
+  %176 = lshr i32 %37, 28
+  %177 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %176
+  %178 = load i32, i32* %177, align 4, !tbaa !20
+  %179 = sitofp i32 %178 to float
+  %180 = or i32 %44, 15
+  %181 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %180, i32 0)  ; BufferLoad(srv,index,wot)
+  %182 = extractvalue %dx.types.ResRet.f32 %181, 0
+  %183 = fmul fast float %182, %179
+  %184 = and i32 %40, 15
+  %185 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %184
+  %186 = load i32, i32* %185, align 4, !tbaa !20
+  %187 = sitofp i32 %186 to float
+  %188 = or i32 %44, 16
+  %189 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %188, i32 0)  ; BufferLoad(srv,index,wot)
+  %190 = extractvalue %dx.types.ResRet.f32 %189, 0
+  %191 = fmul fast float %190, %187
+  %192 = lshr i32 %40, 4
+  %193 = and i32 %192, 15
+  %194 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %193
+  %195 = load i32, i32* %194, align 4, !tbaa !20
+  %196 = sitofp i32 %195 to float
+  %197 = or i32 %44, 17
+  %198 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %197, i32 0)  ; BufferLoad(srv,index,wot)
+  %199 = extractvalue %dx.types.ResRet.f32 %198, 0
+  %200 = fmul fast float %199, %196
+  %201 = lshr i32 %40, 8
+  %202 = and i32 %201, 15
+  %203 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %202
+  %204 = load i32, i32* %203, align 4, !tbaa !20
+  %205 = sitofp i32 %204 to float
+  %206 = or i32 %44, 18
+  %207 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %206, i32 0)  ; BufferLoad(srv,index,wot)
+  %208 = extractvalue %dx.types.ResRet.f32 %207, 0
+  %209 = fmul fast float %208, %205
+  %210 = lshr i32 %40, 12
+  %211 = and i32 %210, 15
+  %212 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %211
+  %213 = load i32, i32* %212, align 4, !tbaa !20
+  %214 = sitofp i32 %213 to float
+  %215 = or i32 %44, 19
+  %216 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %215, i32 0)  ; BufferLoad(srv,index,wot)
+  %217 = extractvalue %dx.types.ResRet.f32 %216, 0
+  %218 = fmul fast float %217, %214
+  %219 = lshr i32 %40, 16
+  %220 = and i32 %219, 15
+  %221 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %220
+  %222 = load i32, i32* %221, align 4, !tbaa !20
+  %223 = sitofp i32 %222 to float
+  %224 = or i32 %44, 20
+  %225 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %224, i32 0)  ; BufferLoad(srv,index,wot)
+  %226 = extractvalue %dx.types.ResRet.f32 %225, 0
+  %227 = fmul fast float %226, %223
+  %228 = lshr i32 %40, 20
+  %229 = and i32 %228, 15
+  %230 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %229
+  %231 = load i32, i32* %230, align 4, !tbaa !20
+  %232 = sitofp i32 %231 to float
+  %233 = or i32 %44, 21
+  %234 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %233, i32 0)  ; BufferLoad(srv,index,wot)
+  %235 = extractvalue %dx.types.ResRet.f32 %234, 0
+  %236 = fmul fast float %235, %232
+  %237 = lshr i32 %40, 24
+  %238 = and i32 %237, 15
+  %239 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %238
+  %240 = load i32, i32* %239, align 4, !tbaa !20
+  %241 = sitofp i32 %240 to float
+  %242 = or i32 %44, 22
+  %243 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %242, i32 0)  ; BufferLoad(srv,index,wot)
+  %244 = extractvalue %dx.types.ResRet.f32 %243, 0
+  %245 = fmul fast float %244, %241
+  %246 = lshr i32 %40, 28
+  %247 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %246
+  %248 = load i32, i32* %247, align 4, !tbaa !20
+  %249 = sitofp i32 %248 to float
+  %250 = or i32 %44, 23
+  %251 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %250, i32 0)  ; BufferLoad(srv,index,wot)
+  %252 = extractvalue %dx.types.ResRet.f32 %251, 0
+  %253 = fmul fast float %252, %249
+  %254 = and i32 %43, 15
+  %255 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %254
+  %256 = load i32, i32* %255, align 4, !tbaa !20
+  %257 = sitofp i32 %256 to float
+  %258 = or i32 %44, 24
+  %259 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %258, i32 0)  ; BufferLoad(srv,index,wot)
+  %260 = extractvalue %dx.types.ResRet.f32 %259, 0
+  %261 = fmul fast float %260, %257
+  %262 = lshr i32 %43, 4
+  %263 = and i32 %262, 15
+  %264 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %263
+  %265 = load i32, i32* %264, align 4, !tbaa !20
+  %266 = sitofp i32 %265 to float
+  %267 = or i32 %44, 25
+  %268 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %267, i32 0)  ; BufferLoad(srv,index,wot)
+  %269 = extractvalue %dx.types.ResRet.f32 %268, 0
+  %270 = fmul fast float %269, %266
+  %271 = lshr i32 %43, 8
+  %272 = and i32 %271, 15
+  %273 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %272
+  %274 = load i32, i32* %273, align 4, !tbaa !20
+  %275 = sitofp i32 %274 to float
+  %276 = or i32 %44, 26
+  %277 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %276, i32 0)  ; BufferLoad(srv,index,wot)
+  %278 = extractvalue %dx.types.ResRet.f32 %277, 0
+  %279 = fmul fast float %278, %275
+  %280 = lshr i32 %43, 12
+  %281 = and i32 %280, 15
+  %282 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %281
+  %283 = load i32, i32* %282, align 4, !tbaa !20
+  %284 = sitofp i32 %283 to float
+  %285 = or i32 %44, 27
+  %286 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %285, i32 0)  ; BufferLoad(srv,index,wot)
+  %287 = extractvalue %dx.types.ResRet.f32 %286, 0
+  %288 = fmul fast float %287, %284
+  %289 = lshr i32 %43, 16
+  %290 = and i32 %289, 15
+  %291 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %290
+  %292 = load i32, i32* %291, align 4, !tbaa !20
+  %293 = sitofp i32 %292 to float
+  %294 = or i32 %44, 28
+  %295 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %294, i32 0)  ; BufferLoad(srv,index,wot)
+  %296 = extractvalue %dx.types.ResRet.f32 %295, 0
+  %297 = fmul fast float %296, %293
+  %298 = lshr i32 %43, 20
+  %299 = and i32 %298, 15
+  %300 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %299
+  %301 = load i32, i32* %300, align 4, !tbaa !20
+  %302 = sitofp i32 %301 to float
+  %303 = or i32 %44, 29
+  %304 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %303, i32 0)  ; BufferLoad(srv,index,wot)
+  %305 = extractvalue %dx.types.ResRet.f32 %304, 0
+  %306 = fmul fast float %305, %302
+  %307 = lshr i32 %43, 24
+  %308 = and i32 %307, 15
+  %309 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %308
+  %310 = load i32, i32* %309, align 4, !tbaa !20
+  %311 = sitofp i32 %310 to float
+  %312 = or i32 %44, 30
+  %313 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %312, i32 0)  ; BufferLoad(srv,index,wot)
+  %314 = extractvalue %dx.types.ResRet.f32 %313, 0
+  %315 = fmul fast float %314, %311
+  %316 = lshr i32 %43, 28
+  %317 = getelementptr inbounds [16 x i32], [16 x i32]* @kE2M1, i32 0, i32 %316
+  %318 = load i32, i32* %317, align 4, !tbaa !20
+  %319 = sitofp i32 %318 to float
+  %320 = or i32 %44, 31
+  %321 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %4, i32 %320, i32 0)  ; BufferLoad(srv,index,wot)
+  %322 = extractvalue %dx.types.ResRet.f32 %321, 0
+  %323 = fmul fast float %322, %319
+  %324 = fadd fast float %51, %28
+  %325 = fadd fast float %324, %60
+  %326 = fadd fast float %325, %69
+  %327 = fadd fast float %326, %78
+  %328 = fadd fast float %327, %87
+  %329 = fadd fast float %328, %96
+  %330 = fadd fast float %329, %105
+  %331 = fadd fast float %330, %113
+  %332 = fadd fast float %331, %121
+  %333 = fadd fast float %332, %130
+  %334 = fadd fast float %333, %139
+  %335 = fadd fast float %334, %148
+  %336 = fadd fast float %335, %157
+  %337 = fadd fast float %336, %166
+  %338 = fadd fast float %337, %175
+  %339 = fadd fast float %338, %183
+  %340 = fadd fast float %339, %191
+  %341 = fadd fast float %340, %200
+  %342 = fadd fast float %341, %209
+  %343 = fadd fast float %342, %218
+  %344 = fadd fast float %343, %227
+  %345 = fadd fast float %344, %236
+  %346 = fadd fast float %345, %245
+  %347 = fadd fast float %346, %253
+  %348 = fadd fast float %347, %261
+  %349 = fadd fast float %348, %270
+  %350 = fadd fast float %349, %279
+  %351 = fadd fast float %350, %288
+  %352 = fadd fast float %351, %297
+  %353 = fadd fast float %352, %306
+  %354 = fadd fast float %353, %315
+  %355 = fadd fast float %354, %323
+  %356 = fmul fast float %355, %26
+  %357 = fadd fast float %356, %19
+  %358 = add i32 %20, 256
+  %359 = call %dx.types.CBufRet.i32 @dx.op.cbufferLoadLegacy.i32(i32 59, %dx.types.Handle %8, i32 0)  ; CBufferLoadLegacy(handle,regIndex)
+  %360 = extractvalue %dx.types.CBufRet.i32 %359, 0
+  %361 = lshr i32 %360, 5
+  %362 = icmp ult i32 %358, %361
+  br i1 %362, label %18, label %363
+
+; <label>:363                                     ; preds = %18
+  br label %364
+
+; <label>:364                                     ; preds = %363, %12
+  %365 = phi float [ 0.000000e+00, %12 ], [ %357, %363 ]
+  %366 = getelementptr [256 x float], [256 x float] addrspace(3)* @"\01?sh@@3PAMA", i32 0, i32 %9
+  store float %365, float addrspace(3)* %366, align 4, !tbaa !24
+  call void @dx.op.barrier(i32 80, i32 9)  ; Barrier(barrierMode)
+  br label %367
+
+; <label>:367                                     ; preds = %376, %364
+  %368 = phi i32 [ 128, %364 ], [ %377, %376 ]
+  %369 = icmp ult i32 %9, %368
+  br i1 %369, label %370, label %376
+
+; <label>:370                                     ; preds = %367
+  %371 = add i32 %368, %9
+  %372 = getelementptr [256 x float], [256 x float] addrspace(3)* @"\01?sh@@3PAMA", i32 0, i32 %371
+  %373 = load float, float addrspace(3)* %372, align 4, !tbaa !24
+  %374 = load float, float addrspace(3)* %366, align 4, !tbaa !24
+  %375 = fadd fast float %374, %373
+  store float %375, float addrspace(3)* %366, align 4, !tbaa !24
+  br label %376
+
+; <label>:376                                     ; preds = %370, %367
+  call void @dx.op.barrier(i32 80, i32 9)  ; Barrier(barrierMode)
+  %377 = lshr i32 %368, 1
+  %378 = icmp eq i32 %377, 0
+  br i1 %378, label %379, label %367
+
+; <label>:379                                     ; preds = %376
+  %380 = icmp eq i32 %9, 0
+  br i1 %380, label %381, label %389
+
+; <label>:381                                     ; preds = %379
+  %382 = load float, float addrspace(3)* getelementptr inbounds ([256 x float], [256 x float] addrspace(3)* @"\01?sh@@3PAMA", i32 0, i32 0), align 4, !tbaa !24
+  %383 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %3, i32 %10, i32 0)  ; BufferLoad(srv,index,wot)
+  %384 = extractvalue %dx.types.ResRet.f32 %383, 0
+  %385 = fmul fast float %384, %382
+  %386 = call %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32 68, %dx.types.Handle %2, i32 %10, i32 0)  ; BufferLoad(srv,index,wot)
+  %387 = extractvalue %dx.types.ResRet.f32 %386, 0
+  %388 = fadd fast float %387, %385
+  call void @dx.op.bufferStore.f32(i32 69, %dx.types.Handle %1, i32 %10, i32 0, float %388, float undef, float undef, float undef, i8 1)  ; BufferStore(uav,coord0,coord1,value0,value1,value2,value3,mask)
+  br label %389
+
+; <label>:389                                     ; preds = %381, %379, %0
+  ret void
+}
+
+; Function Attrs: nounwind readnone
+declare i32 @dx.op.flattenedThreadIdInGroup.i32(i32) #0
+
+; Function Attrs: nounwind readnone
+declare i32 @dx.op.groupId.i32(i32, i32) #0
+
+; Function Attrs: noduplicate nounwind
+declare void @dx.op.barrier(i32, i32) #1
+
+; Function Attrs: nounwind readonly
+declare %dx.types.CBufRet.i32 @dx.op.cbufferLoadLegacy.i32(i32, %dx.types.Handle, i32) #2
+
+; Function Attrs: nounwind readonly
+declare %dx.types.Handle @dx.op.createHandle(i32, i8, i32, i32, i1) #2
+
+; Function Attrs: nounwind
+declare void @dx.op.bufferStore.f32(i32, %dx.types.Handle, i32, i32, float, float, float, float, i8) #3
+
+; Function Attrs: nounwind readonly
+declare %dx.types.ResRet.f32 @dx.op.bufferLoad.f32(i32, %dx.types.Handle, i32, i32) #2
+
+; Function Attrs: nounwind readonly
+declare %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32, %dx.types.Handle, i32, i32) #2
+
+attributes #0 = { nounwind readnone }
+attributes #1 = { noduplicate nounwind }
+attributes #2 = { nounwind readonly }
+attributes #3 = { nounwind }
+
+!llvm.ident = !{!0}
+!dx.version = !{!1}
+!dx.valver = !{!2}
+!dx.shaderModel = !{!3}
+!dx.resources = !{!4}
+!dx.entryPoints = !{!17}
+
+!0 = !{!"dxcoob 1.8.2502.11 (239921522)"}
+!1 = !{i32 1, i32 0}
+!2 = !{i32 1, i32 8}
+!3 = !{!"cs", i32 6, i32 0}
+!4 = !{!5, !13, !15, null}
+!5 = !{!6, !8, !9, !10, !11, !12}
+!6 = !{i32 0, %"class.StructuredBuffer<unsigned int>"* undef, !"", i32 0, i32 0, i32 1, i32 12, i32 0, !7}
+!7 = !{i32 1, i32 4}
+!8 = !{i32 1, %"class.StructuredBuffer<float>"* undef, !"", i32 0, i32 1, i32 1, i32 12, i32 0, !7}
+!9 = !{i32 2, %"class.StructuredBuffer<float>"* undef, !"", i32 0, i32 2, i32 1, i32 12, i32 0, !7}
+!10 = !{i32 3, %"class.StructuredBuffer<float>"* undef, !"", i32 0, i32 3, i32 1, i32 12, i32 0, !7}
+!11 = !{i32 4, %"class.StructuredBuffer<float>"* undef, !"", i32 0, i32 4, i32 1, i32 12, i32 0, !7}
+!12 = !{i32 5, %"class.StructuredBuffer<float>"* undef, !"", i32 0, i32 5, i32 1, i32 12, i32 0, !7}
+!13 = !{!14}
+!14 = !{i32 0, %"class.RWStructuredBuffer<float>"* undef, !"", i32 0, i32 0, i32 1, i32 12, i1 false, i1 false, i1 false, !7}
+!15 = !{!16}
+!16 = !{i32 0, %P* undef, !"", i32 0, i32 0, i32 1, i32 16, null}
+!17 = !{void ()* @main, !"main", null, !4, !18}
+!18 = !{i32 0, i64 16, i32 4, !19}
+!19 = !{i32 256, i32 1, i32 1}
+!20 = !{!21, !21, i64 0}
+!21 = !{!"int", !22, i64 0}
+!22 = !{!"omnipotent char", !23, i64 0}
+!23 = !{!"Simple C/C++ TBAA"}
+!24 = !{!25, !25, i64 0}
+!25 = !{!"float", !22, i64 0}

@@ -277,6 +277,15 @@ class IgpuFcSticky:
                 t = torch.from_numpy(out)
                 return t.to(dev).to(x.dtype).unsqueeze(0)  # (1, M)
 
+            def batch(self_, x):
+                """Batched rows: (N, K) fp32 -> (N, M) fp32 via per-row GEMV calls
+                (context seeding; one-time per request, so the loop is fine)."""
+                assert x.dim() == 2 and x.shape[1] == sticky.K
+                rows = []
+                for i in range(x.shape[0]):
+                    rows.append(self_(x[i]))
+                return torch.cat(rows, dim=0)
+
             def close(self_):
                 sticky.close()
 
@@ -457,3 +466,223 @@ class IgpuMultiClient:
 
     def get_log(self, last_n=20):
         return self.stderr_lines[-last_n:]
+
+
+# ============================================================
+# Phase 2.1: C++ IgpuService-backed IgpuFcSticky (lower Python GIL overhead).
+# Same protocol as IgpuFcSticky but uses the C++ CreateProcessW + pipe bridge
+# in _freetoken_igpu.pyd instead of Python subprocess.Popen.
+# Fallback: if the .pyd isn't loadable, raises immediately (callers should
+# catch and fall back to the Python IgpuFcSticky).
+# ============================================================
+class IgpuFcStickyCPP:
+    """Sticky-weight FC via C++ IgpuService (Phase 2.1) over v3 server FC_LOAD/FC_CALL.
+
+    Same API as IgpuFcSticky.__call__: act_flat (K,) float32 -> (M,) float32.
+    Also exposes .torch() for the same torch bridge as IgpuFcSticky.
+
+    Tested in _test_igpu3 (Phase 2.1 verification): 106ms init, 11ms FC_LOAD,
+    3ms first fc_call, 1ms second fc_call -- basically identical to Python
+    IgpuFcSticky (which is 116ms / 3ms / 3ms). The win is the C++ side
+    captures GetExitCodeProcess / pipe-cleanup paths and gets a small Python
+    GIL release during the IPC, which adds up over 24 GDN verify-forward calls
+    per draft round.
+    """
+
+    def __init__(self, packed_u32, K, scales_f32=None, biases_f32=None, server_path=None):
+        import numpy as np
+        import freetoken.kernel._freetoken_igpu as _igpu  # raises ImportError if missing
+
+        M = packed_u32.shape[0]
+        ns = (scales_f32.shape[1] if scales_f32 is not None else K // 32)
+        if server_path is None:
+            cand = os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                                "benchmarks", "cpu_moe_microbench", "t_mxfp4_gemv_v3_server.exe")
+            server_path = os.path.abspath(cand)
+        if not os.path.exists(server_path):
+            raise FileNotFoundError(f"iGPU v3 server not found: {server_path}")
+
+        # Convert numpy to torch (C++ IgpuService.update_weight takes torch tensors).
+        import torch
+        packed_t = torch.from_numpy(np.ascontiguousarray(packed_u32).astype(np.uint32).view(np.int32)).pin_memory()
+        scales_t = torch.from_numpy(np.ascontiguousarray(scales_f32, dtype=np.float32)).pin_memory() if scales_f32 is not None else \
+                   torch.zeros((M, ns), dtype=torch.float32).pin_memory()
+        biases_t = torch.from_numpy(np.ascontiguousarray(biases_f32, dtype=np.float32)).pin_memory() if biases_f32 is not None else \
+                   torch.zeros((M, ns), dtype=torch.float32).pin_memory()
+
+        # Phase 2.5 (ROCm 6.4, 2026-08-30): inject server_dir into PATH so HIP server
+        # can find amdhip64_6.dll via standard Windows DLL search. The C++ IgpuService
+        # uses CreateProcessW with lpEnvironment=NULL which inherits parent PATH.
+        if server_path and "hip" in server_path.lower():
+            server_dir = os.path.dirname(os.path.abspath(server_path))
+            cur_path = os.environ.get("PATH", "")
+            if server_dir not in cur_path.split(os.pathsep):
+                os.environ["PATH"] = server_dir + os.pathsep + cur_path
+            # Also inject AMD ROCm install dir if present (for amd_comgr_*.dll etc)
+            for rocm_dir in [r"C:\Program Files\AMD\ROCm\6.4\bin",
+                             r"C:\Program Files\AMD\ROCm\6.3\bin"]:
+                if os.path.exists(rocm_dir) and rocm_dir not in cur_path.split(os.pathsep):
+                    os.environ["PATH"] = rocm_dir + os.pathsep + os.environ["PATH"]
+        self._svc = _igpu.igpu.IgpuService(server_path, M, K, ns)
+        # Wait for server ready (logs contain "psoFc ok" / "server ready" / "mxfp4-v3 server ready").
+        t0 = time.time()
+        while time.time() - t0 < 15.0:
+            log = " ".join(self._svc.get_log(8))
+            if "psoFc ok" in log or "server ready" in log:
+                break
+            time.sleep(0.05)
+        # Upload weights.
+        self._svc.update_weight(packed_t, scales_t, biases_t)
+
+        self.M, self.K, self.ns = M, K, ns
+        self.packed_u32 = packed_u32
+        self.scales_f32 = scales_f32
+        self.biases_f32 = biases_f32
+        self.stderr_lines = []  # for compat with IgpuFcSticky.torch()
+        self._lock = threading.Lock()
+
+    def __call__(self, act_flat):
+        import numpy as np
+        import torch  # needed for pin_memory() below
+        assert act_flat.dtype == np.float32
+        assert act_flat.shape == (self.K,), f"act shape {act_flat.shape} != ({self.K},)"
+        act_t = torch.from_numpy(np.ascontiguousarray(act_flat, dtype=np.float32)).pin_memory()
+        with self._lock:
+            out_t = self._svc.fc_call(act_t)
+        # out_t is a torch tensor of dtype float32, shape (M,). Convert to numpy.
+        return out_t.cpu().numpy().copy()
+
+    def torch(self):
+        import torch
+        sticky = self
+        class _TorchFc:
+            def __call__(self_, x):
+                if x.dim() == 2 and x.shape[0] == 1:
+                    x = x.squeeze(0)
+                elif x.dim() == 1:
+                    pass
+                else:
+                    x = x.reshape(-1)
+                act = x.detach().to('cpu').contiguous().to(torch.float32).numpy()
+                out_np = sticky(act)
+                return torch.from_numpy(out_np).to(x.device).to(x.dtype)
+        return _TorchFc()
+
+    def close(self):
+        try:
+            self._svc.close()
+        except Exception:
+            pass
+
+    def get_log(self, last_n=20):
+        try:
+            return self._svc.get_log(last_n)
+        except Exception:
+            return []
+
+    def __del__(self):
+        self.close()
+
+
+def _resolve_hip_fc_server_path():
+    """Return path to t_mxfp4_gemv_v3_hip_server.exe (ROCm/HIP port), or None if not available.
+
+    Looks in: 1) explicit server_path arg, 2) source tree, 3) bundled dist/bin/, 4) AMD ROCm install.
+    Returns None if HIP server exe not found OR amdhip64_6.dll missing (which it needs to launch).
+    """
+    candidates = []
+    # 1. PyInstaller bundle: look next to the running exe (sys.executable).
+    import sys
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.append(os.path.join(exe_dir, "t_mxfp4_gemv_v3_hip_server.exe"))
+        # Some bundle layouts put binaries under a subfolder
+        candidates.append(os.path.join(exe_dir, "bin", "t_mxfp4_gemv_v3_hip_server.exe"))
+    # 2. PyInstaller _MEIPASS2 temp dir
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "t_mxfp4_gemv_v3_hip_server.exe"))
+        candidates.append(os.path.join(meipass, "bin", "t_mxfp4_gemv_v3_hip_server.exe"))
+    # 3. Source tree (dev runs)
+    candidates.append(os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                                   "benchmarks", "cpu_moe_microbench", "t_mxfp4_gemv_v3_hip_server.exe"))
+    candidates.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..",
+                                                   "dist", "bin", "t_mxfp4_gemv_v3_hip_server.exe")))
+    # 4. System ROCm install
+    candidates.append(r"C:\Program Files\AMD\ROCm\6.4\bin\t_mxfp4_gemv_v3_hip_server.exe")
+    for c in candidates:
+        if os.path.exists(c):
+            return os.path.abspath(c)
+    return None
+
+
+def _hip_fc_server_available():
+    """True if AMD HIP runtime DLLs are loadable from PATH or server dir (auto-injects)."""
+    server_path = _resolve_hip_fc_server_path()
+    if server_path is None:
+        return False
+    server_dir = os.path.dirname(server_path)
+    # Check if amdhip64_6.dll is accessible (either in PATH, in server dir, or in
+    # other common ROCm locations that may be present in a FreeToken bundle).
+    cur_path = os.environ.get("PATH", "")
+    for entry in cur_path.split(os.pathsep):
+        if os.path.exists(os.path.join(entry, "amdhip64_6.dll")):
+            return True
+        if os.path.exists(os.path.join(entry, "amdhip64.dll")):
+            return True
+    # Check server dir, exe dir, and common subfolders
+    import sys
+    check_dirs = [server_dir]
+    if getattr(sys, "frozen", False):
+        check_dirs.append(os.path.dirname(os.path.abspath(sys.executable)))
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        check_dirs.append(meipass)
+        check_dirs.append(os.path.join(meipass, "bin"))
+    for d in check_dirs:
+        if (os.path.exists(os.path.join(d, "amdhip64_6.dll")) or
+            os.path.exists(os.path.join(d, "amdhip64.dll"))):
+            return True
+    # Check system ROCm install
+    rocm = r"C:\Program Files\AMD\ROCm\6.4\bin"
+    if os.path.exists(os.path.join(rocm, "amdhip64_6.dll")):
+        return True
+    return False
+
+
+def make_igpu_fc_sticky(packed_u32, K, scales_f32=None, biases_f32=None, server_path=None,
+                        prefer_cpp=True, prefer_hip=True):
+    """Factory: prefer the C++ IgpuFcStickyCPP when the .pyd is loadable, else fall back
+    to the Python IgpuFcSticky. Used by load_mtp_head_from_safetensors to upgrade the
+    FC path with zero caller-side changes.
+    """
+    # Phase 2.5 (ROCm 6.4 adaptation, 2026-08-30): prefer HIP server on AMD Radeon 780M.
+    # The HIP server uses AMD's ROCm API directly (vs D3D12's general GPU compute path).
+    # On AMD Radeon 780M (gfx1103, RDNA 3) we get true ROCm/HIP compute, otherwise D3D12.
+    if prefer_cpp and prefer_hip:
+        hip_server = server_path if server_path and "hip" in server_path.lower() \
+                      else _resolve_hip_fc_server_path()
+        print(f"[igpu_fc] HIP server candidate: {hip_server}")
+        print(f"[igpu_fc] HIP available: {_hip_fc_server_available()}")
+        if hip_server and _hip_fc_server_available():
+            try:
+                client = IgpuFcStickyCPP(packed_u32, K, scales_f32=scales_f32,
+                                         biases_f32=biases_f32, server_path=hip_server)
+                print(f"[igpu_fc] Using C++ IgpuFcStickyCPP with HIP server: {hip_server}")
+                return client
+            except Exception as _e:
+                print(f"[igpu_fc] HIP C++ path failed: {_e}")
+                pass  # fall through to D3D12
+    if prefer_cpp:
+        try:
+            client = IgpuFcStickyCPP(packed_u32, K, scales_f32=scales_f32, biases_f32=biases_f32,
+                                     server_path=server_path)
+            print(f"[igpu_fc] Using C++ IgpuFcStickyCPP with D3D12 server: {server_path}")
+            return client
+        except Exception as _e:
+            print(f"[igpu_fc] D3D12 C++ path failed: {_e}")
+            pass  # fall through
+    print(f"[igpu_fc] Falling back to Python IgpuFcSticky")
+    return IgpuFcSticky(packed_u32, K, scales_f32=scales_f32, biases_f32=biases_f32,
+                        server_path=server_path)
+

@@ -1,0 +1,10 @@
+ready fd0=0 fd1=1 fd2=2
+device ok
+pso ok
+REALLOC curM=0 M=1 curK=0 K=4096
+uploadBuf grew to 18952
+  before dispatch M=1 rOutState=8
+  readback: 5f 64 13 40
+  v[0]=2.303
+Dispatch M=1 K=4096: 5.226ms
+header read failed

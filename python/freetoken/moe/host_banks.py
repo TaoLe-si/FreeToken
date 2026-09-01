@@ -144,10 +144,13 @@ class HostBank:
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
-        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
+        For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped. Windows has no MADV_DONTNEED (mmap.madvise exists but the constant does not) and pagefile-backed views cannot be decommitted from user mode -- there the call is a no-op and the converter subprocess exit reclaims the commit."""
         if self._pinned:
             return
-        self._buf.madvise(mmap.MADV_DONTNEED)
+        madvise = getattr(self._buf, "madvise", None)
+        dontneed = getattr(mmap, "MADV_DONTNEED", None)
+        if madvise is not None and dontneed is not None:
+            madvise(dontneed)
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.

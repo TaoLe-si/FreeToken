@@ -11,6 +11,7 @@ inside the kernel; the conv state is updated in place (no separate scatter).
 from __future__ import annotations
 
 import torch
+from typing import Optional
 
 _PAD_SLOT_ID = -1
 
@@ -22,9 +23,13 @@ def causal_conv1d_varlen(
     cu_seqlens: torch.Tensor,   # [batch+1] int32 prefix sums of per-request lengths
     cache_indices: torch.Tensor,    # [batch] int32 slot id per request
     has_initial_state: torch.Tensor,  # [batch] bool (carry conv state across chunks)
+    batch: Optional[int] = None,    # host-known batch size (CUDA graph capturable)
+    max_seq_len: Optional[int] = None,  # host-known max seq len (CUDA graph capturable)
 ) -> torch.Tensor:
     """Varlen (prefill) depthwise causal conv with silu; writes silu(conv) into ``x``
-    in place and refreshes ``conv_states[cache_indices]`` with each request's tail."""
+    in place and refreshes ``conv_states[cache_indices]`` with each request's tail.
+    ``batch`` and ``max_seq_len`` are optional host-known metadata -- pass them from the
+    MTP verify path so CUDA graph capture avoids .item() syncs."""
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
     if not is_sgl_kernel_installed():
@@ -33,7 +38,8 @@ def causal_conv1d_varlen(
         )
 
         return triton_causal_conv1d_varlen(
-            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state
+            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state,
+            activation="silu", batch=batch, max_seq_len=max_seq_len
         )
 
     # Defensive device alignment: with --kv-device cpu the FLAMetadata index

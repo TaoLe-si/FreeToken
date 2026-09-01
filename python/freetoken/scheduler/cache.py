@@ -406,7 +406,16 @@ class CacheManager:
             # remain as reuse points).
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
-            if insert_len == req.cached_len and insert_len > 0:
+            # mtp_no_live_donate: the request ended via an MTP verify EOS truncation,
+            # so cached_len sits BELOW the live slot's post-verify depth -- attaching
+            # that state to a shorter prefix node would COW-restore an over-advanced
+            # GDN state on a future hit. The frozen ×64 ping-pong snapshot above is
+            # still donated (it is exact); only the live-slot donate is suppressed.
+            if (
+                insert_len == req.cached_len
+                and insert_len > 0
+                and not getattr(req, "mtp_no_live_donate", False)
+            ):
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)

@@ -1,0 +1,384 @@
+/* ══════════════════════════════════════════════════════════════
+   FreeToken × DeepSeek Harness 设计对齐层
+   Token 源：DSH Web 官方样式表（127.0.0.1:3080 活体提取）
+   色板 dsw-static-* · 动效 ds-transition-* · 阴影 dsw-shadow-lv*
+   ══════════════════════════════════════════════════════════════ */
+
+/* ---------- 1. Token 桥（默认暗色 = harness bluish-950 系） ---------- */
+:root{
+  /* 动效 */
+  --ds-ease: cubic-bezier(.4, 0, .2, 1);
+  --ds-dur: .2s; --ds-dur-fast: .1s; --ds-dur-slow: .3s;
+  /* 字体 */
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+             "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-code: "SF Mono", "JetBrains Mono", "Fira Code", Consolas,
+               "Liberation Mono", Menlo, monospace;
+  /* 品牌与语义（harness static） */
+  --ds-brand: rgb(65, 118, 230);        /* deepseek-500 */
+  --ds-brand-hover: rgb(86, 134, 254);  /* deepseek-450 */
+  --ds-green: rgb(34, 197, 94); --ds-green-sec: rgb(78, 209, 126);
+  --ds-amber: rgb(245, 158, 11); --ds-red: rgb(239, 68, 68);
+  --shadow-lv1: 0 2px 4px 0 rgba(0,0,0,.05);
+  --shadow-lv2: 0 4px 12px 0 rgba(0,0,0,.02), 0 2px 8px 0 rgba(0,0,0,.04);
+  --shadow-lv3: 0 0 1px 0 rgba(0,0,0,.2), 0 0 4px 0 rgba(0,0,0,.02), 0 12px 32px 0 rgba(0,0,0,.12);
+  --radius-menu: 12px;
+
+  /* —— 暗色（默认）—— */
+  --bg: rgb(21, 21, 23);            /* bluish-950 */
+  --bg-panel: rgb(27, 27, 28);      /* bluish-900 */
+  --bg-inset: rgb(15, 17, 21);      /* bluish-1000 */
+  --bg-sidebar: rgb(27, 27, 28);
+  --bg-hover: rgba(255,255,255,.06);
+  --bg-active: rgba(255,255,255,.09);
+  --border: rgba(255,255,255,.10);
+  --border-soft: rgba(255,255,255,.055);
+  --text: rgb(255,255,255);
+  --text-dim: rgb(173, 178, 184);   /* bluish-400 */
+  --text-faint: rgb(129, 133, 140); /* bluish-600 */
+  --accent: var(--ds-brand);
+  --accent-deep: rgb(72, 104, 178); /* deepseek-600 */
+  --accent-soft: rgba(65,118,230,.16);
+  --btn-primary-fill: rgb(255,255,255);
+  --btn-primary-text: rgb(15,17,21);
+  --menu-bg: rgb(44, 44, 46);       /* tooltip-bg 850 */
+}
+/* —— 日间（body.light）＝ harness 原生亮色 —— */
+body.light{
+  --bg: rgb(249, 250, 251);         /* bluish-50 */
+  --bg-panel: rgb(255, 255, 255);   /* bluish-00 */
+  --bg-inset: rgb(241, 243, 245);   /* bluish-75 */
+  --bg-sidebar: rgb(249, 250, 251);
+  --bg-hover: rgba(38, 49, 72, .06);
+  --bg-active: rgba(38, 49, 72, .10);
+  --border: rgba(0, 0, 0, .10);
+  --border-soft: rgba(0, 0, 0, .04);
+  --text: rgb(15, 17, 21);
+  --text-dim: rgb(97, 102, 107);    /* bluish-700 */
+  --text-faint: rgb(129, 133, 140);
+  --accent: var(--ds-brand);
+  --accent-deep: rgb(47, 76, 143);
+  --accent-soft: rgba(65,118,230,.10);
+  --btn-primary-fill: rgb(15, 17, 21);   /* brand-primary＝近黑 */
+  --btn-primary-text: rgb(255,255,255);
+  --menu-bg: rgb(255,255,255);
+}
+
+/* ---------- 2. 全局基线 ---------- */
+body{ font-family: var(--font-ui); }
+button, input, select, textarea{ font-family: inherit; }
+:focus-visible{ outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+::-webkit-scrollbar{ width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb{ background: var(--border); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover{ background: var(--text-faint); }
+::-webkit-scrollbar-track{ background: transparent; }
+
+/* ---------- 3. 动效体系 ---------- */
+@keyframes ftFadeIn{ from{ opacity:0; transform: translateY(4px);} to{ opacity:1; transform:none;} }
+@keyframes ftDrawerIn{ from{ transform: translateX(24px); opacity:.4;} to{ transform:none; opacity:1;} }
+@keyframes ftChase{ 0%{transform:scale(.6);opacity:.4} 50%{transform:scale(1);opacity:1} 100%{transform:scale(.6);opacity:.4} }
+.page{ animation: ftFadeIn var(--ds-dur) var(--ds-ease); }
+.tabpane{ animation: ftFadeIn var(--ds-dur-fast) var(--ds-ease); }
+
+/* ---------- 4. 侧边导航（specific-sidebar-* 规范） ---------- */
+.sidebar{ background: var(--bg-sidebar); border-right: 1px solid var(--border-soft);
+  /* width 与 min-width 必须同时过渡：min-width 瞬跳会顶死展开动画 */
+  transition: width var(--ds-dur-slow) var(--ds-ease), min-width var(--ds-dur-slow) var(--ds-ease); }
+.nav-item{
+  position: relative; border-radius: 10px; color: var(--text-dim);
+  transition: background var(--ds-dur-fast) var(--ds-ease), color var(--ds-dur-fast) var(--ds-ease);
+}
+.nav-item:hover{ background: var(--bg-hover); color: var(--text); }
+.nav-item.active{ background: var(--bg-active); color: var(--text); }
+.nav-item.active::before{
+  content:""; position:absolute; left:-8px; top:20%; height:60%; width:3px;
+  border-radius:3px; background: var(--accent);
+}
+
+/* ---------- 5. 控件统一（输入 / 下拉 / 按钮） ---------- */
+input[type="text"], input[type="number"], input[type="password"], textarea{
+  background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: 10px; color: var(--text);
+  transition: border-color var(--ds-dur-fast) var(--ds-ease), box-shadow var(--ds-dur-fast) var(--ds-ease);
+}
+input[type="text"]:focus, input[type="number"]:focus, textarea:focus{
+  outline:none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+}
+select{
+  appearance:none; -webkit-appearance:none;
+  background-color: var(--bg-panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 6px 30px 6px 10px; cursor:pointer;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%237f838a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+  background-repeat:no-repeat; background-position: right 10px center;
+  transition: border-color var(--ds-dur-fast) var(--ds-ease), box-shadow var(--ds-dur-fast) var(--ds-ease);
+}
+select:hover{ border-color: var(--text-faint); }
+select:focus{ outline:none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+select option{ background: var(--menu-bg); color: var(--text); }
+
+.btn{
+  border-radius: 10px; transition:
+    background var(--ds-dur-fast) var(--ds-ease),
+    box-shadow var(--ds-dur) var(--ds-ease),
+    transform var(--ds-dur-fast) var(--ds-ease);
+}
+.btn:active{ transform: translateY(1px); }
+.btn-primary{
+  background: var(--btn-primary-fill); color: var(--btn-primary-text);
+  border: 1px solid transparent; box-shadow: var(--shadow-lv1);
+}
+.btn-primary:hover{ filter: brightness(.94); box-shadow: var(--shadow-lv2); }
+body.light .btn-primary:hover{ filter: brightness(1.35); }
+.btn-success{ background: var(--ds-green); }
+.btn-danger{ background: var(--ds-red); }
+
+/* ---------- 6. 卡片 / 列表 ---------- */
+.card{
+  border-radius: var(--radius-menu); border: 1px solid var(--border-soft);
+  box-shadow: var(--shadow-lv1);
+}
+.model-row{
+  border-radius: var(--radius-menu); transition:
+    border-color var(--ds-dur-fast) var(--ds-ease),
+    background var(--ds-dur-fast) var(--ds-ease);
+}
+.model-row:hover{ background: var(--bg-hover); }
+.model-row.selected{ border-color: var(--accent); background: var(--accent-soft); }
+.fit-badge.ok{ color: var(--ds-green-sec); background: rgba(34,197,94,.12); }
+.fit-badge.warn{ color: var(--ds-amber); background: rgba(245,158,11,.12); }
+.fit-badge.bad{ color: var(--ds-red); background: rgba(239,68,68,.10); }
+
+/* ---------- 7. 参数抽屉（lv3 阴影 + 缓动滑入） ---------- */
+.params-drawer{ box-shadow: var(--shadow-lv3); transition: transform var(--ds-dur-slow) var(--ds-ease); }
+.params-drawer.open{ animation: ftDrawerIn var(--ds-dur-slow) var(--ds-ease); }
+
+/* ---------- 8. 聊天（气泡 = harness specific-bubble） ---------- */
+.msg.user > .msg-ans, .msg.user{
+  background: var(--accent-soft); border-radius: 12px !important;
+}
+.msg.assistant{ border-radius: 12px; }
+.thinking::after{ content:"…"; animation: ftChase 1.1s infinite var(--ds-ease); }
+
+/* ---------- 9. 状态灯（呼吸） ---------- */
+.status-pill .dot.on{ animation: ftChase 1.6s infinite var(--ds-ease); }
+
+/* ---------- 10. Toast（顶部居中滑落，harness toast 规范） ---------- */
+@keyframes toastIn{
+  from{ opacity:0; transform: translate(-50%, -12px) scale(.98); }
+  to{ opacity:1; transform: translate(-50%, 0) scale(1); }
+}
+.toast{
+  position: fixed; left: 50%; top: 18px; transform: translateX(-50%);
+  background: var(--menu-bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-menu);
+  box-shadow: var(--shadow-lv3); animation: toastIn var(--ds-dur) var(--ds-ease);
+}
+
+/* ---------- 11. 侧栏底部：运行模型实时状态灯 ---------- */
+.model-live{
+  display:flex; align-items:center; gap:8px; padding:8px 10px; margin-bottom:6px;
+  border-radius:10px; background:var(--bg-hover); min-width:0; max-width:100%;
+}
+.live-dot{
+  flex:0 0 auto; width:9px; height:9px; border-radius:50%;
+  background: var(--ds-red);
+  transition: background var(--ds-dur-fast) var(--ds-ease);
+}
+.model-live.on .live-dot{ background: var(--ds-green-sec); animation: ftChase 1.6s infinite var(--ds-ease); }
+.live-name{
+  font-size:12px; color:var(--text-dim); line-height:1.3;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  transition: color var(--ds-dur-fast) var(--ds-ease);
+}
+.model-live.on .live-name{ color: var(--text); }
+.sidebar.collapsed .model-live{ justify-content:center; padding:8px 4px; }
+.sidebar.collapsed .live-name{ display:none; }
+
+/* ---------- 12. 下拉选项卡（harness 菜单规范：radius12 · lv3 阴影 · 4px 内衬） ---------- */
+.ft-select{ position:relative; display:inline-block; min-width:0; }
+.ft-select-btn{
+  display:flex; align-items:center; justify-content:space-between; gap:8px;
+  width:100%; box-sizing:border-box;
+  background:var(--bg-panel); color:var(--text);
+  border:1px solid var(--border); border-radius:10px;
+  padding:6px 10px; font-size:inherit; line-height:1.4;
+  cursor:pointer; text-align:left;
+  transition: border-color var(--ds-dur-fast) var(--ds-ease), box-shadow var(--ds-dur-fast) var(--ds-ease);
+}
+.ft-select-btn:hover{ border-color: var(--text-faint); }
+.ft-select.open .ft-select-btn{ border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.ft-select-btn > span{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.ft-select-btn .chev{
+  flex:0 0 auto; transition: transform var(--ds-dur) var(--ds-ease);
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%237f838a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+  background-repeat:no-repeat; background-position:center;
+  width:16px; height:16px;
+}
+.ft-select.open .chev{ transform: rotate(180deg); }
+.ft-select-menu{
+  position:absolute; left:0; top:calc(100% + 6px); z-index:1200;
+  min-width:100%; max-height:264px; overflow:auto; overscroll-behavior:contain;
+  display:none; flex-direction:column; gap:0; padding:4px;
+  background:var(--menu-bg); border:1px solid var(--border-soft);
+  border-radius: var(--radius-menu); box-shadow: var(--shadow-lv3);
+  animation: ftFadeIn var(--ds-dur-fast) var(--ds-ease);
+}
+.ft-select.open .ft-select-menu{ display:flex; }
+.ft-select-item{
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+  padding:7px 10px; border-radius:8px; cursor:pointer;
+  color:var(--text-dim); font-size:inherit; white-space:nowrap;
+  transition: background var(--ds-dur-fast) var(--ds-ease), color var(--ds-dur-fast) var(--ds-ease);
+}
+.ft-select-item:hover{ background:var(--bg-hover); color:var(--text); }
+.ft-select-item.sel{ background:var(--accent-soft); color:var(--text); font-weight:500; }
+.ft-select-item.sel::after{
+  content:""; width:13px; height:13px; flex:0 0 auto;
+  background-color: var(--accent);
+  -webkit-mask:center/contain no-repeat url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'><path d='M20 6 9 17l-5-5'/></svg>");
+          mask:center/contain no-repeat url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'><path d='M20 6 9 17l-5-5'/></svg>");
+}
+.ft-select.up .ft-select-menu{ top:auto; bottom:calc(100% + 6px); }
+
+.ft-native{ appearance:none; -webkit-appearance:none; }
+
+/* ---------- 13. 按钮可读性修正 + 状态灯第三态（ft-btnfix） ---------- */
+.btn-danger{ background: var(--ds-red) !important; color:#fff !important; border:none !important; font-weight:500; }
+.btn-danger:hover{ filter: brightness(1.08); }
+.btn-success{ color:#fff !important; border:none !important; font-weight:500; }
+.btn[disabled]{ opacity:.45; cursor:not-allowed; transform:none !important; box-shadow:none !important; }
+.live-dot{ background: var(--text-faint); }
+.model-live.load .live-dot{ background: var(--ds-amber); animation: ftChase 1s infinite var(--ds-ease); }
+.model-live.on .live-dot{ background: var(--ds-green-sec); }
+.status-pill .dot.load{ background: var(--ds-amber); animation: ftChase 1s infinite var(--ds-ease); }
+
+/* ---------- 14. 收起侧栏纯图标 / 历史删除 / 下拉占位 / 异常态 ---------- */
+.sidebar.collapsed .nav-label,
+.sidebar.collapsed .brand-text,
+.sidebar.collapsed .monitor,
+.sidebar.collapsed #themeLabel{ display:none !important; }
+.sidebar.collapsed #themeBtn::before{ content:"◐"; font-size:14px; }
+.history-item{ position:relative; padding-right:26px !important; }
+.history-item .hi-title{ display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.history-del{
+  position:absolute; right:6px; top:50%; transform:translateY(-50%);
+  width:18px; height:18px; line-height:16px; text-align:center;
+  border:none; border-radius:6px; background:transparent; color:var(--text-faint);
+  cursor:pointer; opacity:0; font-size:14px;
+  transition: opacity var(--ds-dur-fast) var(--ds-ease), background var(--ds-dur-fast) var(--ds-ease), color var(--ds-dur-fast) var(--ds-ease);
+}
+.history-item:hover .history-del, .history-item.active .history-del{ opacity:1; }
+.history-del:hover{ background:rgba(239,68,68,.12); color:var(--ds-red); }
+.ft-select-btn.ft-ph > span{ color: var(--text-faint); }
+.model-live.err .live-dot{ background: var(--ds-red); animation: ftChase .9s infinite var(--ds-ease); }
+
+/* ---------- 15. 参数抽屉关闭钮 / 收起钮原样三角 ---------- */
+.drawer-close{
+  position:absolute; top:10px; right:12px;
+  width:28px; height:28px; border:none; border-radius:8px;
+  background:transparent; color:var(--text-dim);
+  font-size:20px; line-height:1; cursor:pointer;
+  transition: background var(--ds-dur-fast) var(--ds-ease), color var(--ds-dur-fast) var(--ds-ease);
+}
+.drawer-close:hover{ background:var(--bg-hover); color:var(--text); }
+
+/* ---------- 17. 引擎级参数「需重载」徽标（state-warn 规范） ---------- */
+.ft-reload-hint{
+  /* 紧贴 set-row 最左 (取消 margin-left), 跟 label 之间留 7px, 视觉上是 [hint][label][...][input] */
+  display:inline-block; margin-left:0; margin-right:7px; padding:1px 7px;
+  font-size:10px; line-height:16px; font-weight:500;
+  border-radius:999px; vertical-align:middle;
+  color: var(--ds-amber);
+  background: rgba(245,158,11,.13);
+  border: 1px solid rgba(245,158,11,.25);
+  cursor: help;
+}
+
+.msg.user > .msg-ans{
+  background: linear-gradient(135deg, rgb(65,118,230), rgb(53,96,190)) !important;
+  color:#fff !important; font-weight:500;
+  border-radius:12px !important; padding:10px 14px !important;
+  display:inline-block; max-width:78%;
+  box-shadow: var(--shadow-lv1);
+  animation: ftFadeIn var(--ds-dur) var(--ds-ease);
+}
+
+/* ---------- 18. 对话气泡：harness 布局规范 ---------- */
+.msg.user{ align-self:flex-end; justify-content:flex-end; }
+.msg.user > .msg-ans{
+  background: rgb(65,118,230) !important;
+  color:#fff !important; font-weight:500;
+  border-radius:12px 12px 4px 12px !important;
+  padding:10px 14px !important;
+  display:inline-block; max-width:78%;
+  box-shadow: var(--shadow-lv1);
+  animation: ftFadeIn var(--ds-dur-fast) var(--ds-ease);
+}
+.msg.assistant{ align-self:flex-start; }
+.msg.assistant > .msg-ans{
+  background: transparent !important;
+  border:none !important; box-shadow:none !important;
+  padding:2px 4px !important;
+  animation: ftFadeIn var(--ds-dur) var(--ds-ease);
+}
+
+/* ---------- 19. 聊天流终修：尺寸归外层 / 动效 / 指示 ---------- */
+.msg.user{ background:transparent !important; border:none !important; box-shadow:none !important; }
+.msg.user > .msg-ans{
+  display:block !important;      /* 修复：inline-block+百分比 在收缩父级下逐字换行 */
+  max-width:none !important;
+  white-space:pre-wrap; word-break:break-word;
+}
+@keyframes ftPopIn{ from{opacity:0; transform:translateY(8px) scale(.985)} to{opacity:1; transform:none} }
+.msg.user, .msg.assistant{ animation: ftPopIn var(--ds-dur) var(--ds-ease); transform-origin:bottom center; }
+/* 三点思考指示 */
+.msg.thinking{ background:var(--bg-panel)!important; border:1px solid var(--border)!important; padding:10px 14px!important; border-radius:12px 12px 12px 4px!important; align-self:flex-start; }
+.ft-dots i{ display:inline-block; width:5px; height:5px; margin-right:4px; border-radius:50%;
+  background:var(--text-dim,#8b93a7); vertical-align:middle; animation:ftBlink 1.2s infinite; }
+.ft-dots i:nth-child(2){ animation-delay:.18s } .ft-dots i:nth-child(3){ animation-delay:.36s }
+@keyframes ftBlink{ 0%,80%,100%{opacity:.25} 40%{opacity:1} }
+.ft-tstat{ color:var(--text-dim,#aab2c5); font-style:italic; font-size:13px; vertical-align:middle; }
+/* 流式光标 */
+.ft-caret{ color:rgb(65,118,230); animation:ftCaret 1s steps(2) infinite; margin-left:1px; }
+@keyframes ftCaret{ 0%,49%{opacity:1} 50%,100%{opacity:0} }
+
+/* ---------- 20. 「需重载」徽章：小窗不换行不错位 ---------- */
+.ft-reload-hint{
+  white-space: nowrap !important;
+  min-width: max-content;          /* 永远一行完整文字 */
+  max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; /* 极窄时整行省略而非错位 */
+  flex: 0 0 auto;
+}
+
+/* ---------- 21. 搜索行量化下拉：不被按钮遮挡 ---------- */
+.model-row{ overflow: visible; }
+.model-info{ flex: 1 1 auto; min-width: 0; }
+.model-actions{ position: relative; z-index: 5; }
+.quant-sel{
+  position: relative; z-index: 6;
+  flex: 0 0 auto; width: auto; min-width: 118px; max-width: 190px;
+  height: 26px; margin-left: 2px; padding: 0 20px 0 8px;
+  font-size: 12px; line-height: 24px;
+  color: var(--text, #dfe4ee); background: rgba(255,255,255,.06);
+  border: 1px solid var(--border); border-radius: 8px;
+  appearance: none; -webkit-appearance: none; cursor: pointer;
+}
+.quant-sel:focus{ outline: none; border-color: rgb(65,118,230); }
+
+/* ---------- 22. 下拉弹层层级终裁 ---------- */
+.ft-select{ position: relative; }
+.ft-select.open{ z-index: 100000; }
+.ft-select-menu{ z-index: 100000 !important; }
+.set-row, .model-row{ overflow: visible; }
+.quant-sel{ z-index: auto; }  /* 原生控件无需页面内层级 */
+
+/* ---------- 23. 长模型名不篡位：单行省略 ---------- */
+.model-name, .model-path{
+  display:block; white-space:nowrap;
+  overflow:hidden; text-overflow:ellipsis;
+  max-width:100%;
+}
+.model-info{ flex:1 1 auto; min-width:0; }
+.model-tags{ flex:0 1 auto; min-width:0; }

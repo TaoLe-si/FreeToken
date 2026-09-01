@@ -227,3 +227,7 @@ benchmarks/cross_framework
 
 # local e2e/bench artifacts (harnesses may run with repo cwd)
 /results/
+
+# embedded repos without checked-out commits (cannot be indexed)
+benchmarks/cpu_moe_microbench/tools/vkpeak/
+FreeToken-Web/

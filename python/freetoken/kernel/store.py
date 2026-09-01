@@ -43,7 +43,15 @@ def store_cache(
         module = _jit_store_module(element_size)
         module.launch(k_cache, v_cache, indices, k, v)
         return
-    except Exception:
+    except Exception as _exc:
+        import os as _os
+        if _os.environ.get("FT_STORE_DEBUG") or _torch.cuda.is_current_stream_capturing():
+            print(
+    f"[store_cache] JIT launch failed: {_exc!r} | devices: "
+    f"k_cache={k_cache.device} v_cache={v_cache.device} "
+    f"indices={indices.device} k={k.device} v={v.device} "
+    f"kc_shape={tuple(k_cache.shape)} k_shape={tuple(k.shape)}", flush=True
+)
         pass  # fall through to torch fallback
     # PyTorch fallback: scatter k/v into k_cache/v_cache at given indices
     idx_long = indices.to(k_cache.dtype).to(_torch.long) if False else indices.to(k_cache.device).to(_torch.long)

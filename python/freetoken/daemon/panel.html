@@ -55,7 +55,7 @@
 <!-- ═══════════ 主区域 ═══════════ -->
 <main class="main">
 <!-- ─── 页面：模型库 ─── -->
-<section class="page active" id="page-models">
+<section class="page active" id="page-models">>
   <header class="page-head"><h1>模型库</h1><p class="page-sub">推荐 · 内置模型一键下载 · 本地管理</p></header>
   <div class="rec-wrap" id="recBanner">
     <div class="rec-head"><span class="rec-title">为本机推荐</span><span class="muted" id="recMeta"></span></div>
@@ -227,16 +227,28 @@
         <div class="set-row"><span>CORS 允许源</span><input id="sCors" value="*"></div>
       </div>
       <div class="card"><h2 class="card-title">引擎类</h2>
-        <div class="set-row slider-row"><span>并发上限</span><input type="range" id="sConcurrency" min="1" max="256" step="1" value="32"><b class="row-val" id="valConcurrency">32</b></div>
-        <div class="set-row slider-row"><span>CPU 线程数</span><input type="range" id="sCpuThreads" min="1" max="64" step="1" value="8"><b class="row-val" id="valCpuThreads">8</b></div>
-        <div class="set-row slider-row"><span>显存预算 GB</span><input type="range" id="sVramBudget" min="0" max="24" step="0.5" value="0"><b class="row-val" id="valVramBudget">自动</b></div>
-        <div class="set-row"><span>MoE 计算模式</span><select id="sMoeBackend"><option value="auto">auto</option><option value="fused">fused</option><option value="offload">offload</option><option value="cpu">cpu</option><option value="hybrid">hybrid</option><option value="igpu">igpu ★</option></select></div>
-        <div class="set-row hl"><span>稠密模型 FFN 引擎 ★</span><select id="sDenseEngine"><option value="cpu">cpu</option><option value="igpu" selected>igpu</option><option value="gpu">gpu</option></select></div>
-        <div class="set-row hl"><span>iGPU 服务路径 ★</span><input id="sIgpuService" placeholder="留空=内置"></div>
-        <div class="set-row hl"><span>iGPU 无降级 ★</span><input id="sIgpuNoFallback" type="checkbox"></div>
-        <div class="set-row hl"><span>KV 缓存位置 ★</span><select id="sKvDevice"><option value="cuda">显存（严格预算）</option><option value="shared">共享显存池</option><option value="cpu" selected>主存（实验）</option></select></div>
-        <div class="set-row hl"><span>KV 量化 ★</span><select id="sKvQuant"><option value="bf16" selected>BF16（精度最高，内存最大）</option><option value="q8_0">Q8_0（内存减半）</option><option value="q4_0">Q4_0（内存 1/4）</option></select></div>
-        <div class="set-row hl"><span>推理精度策略 ★</span><select id="sCtFp8"><option value="native" selected>自动（FP8层W8A16 / NVFP4层W4A16）</option><option value="bf16">全部反量化 BF16</option></select></div>
+        <div class="set-row slider-row"><span>并发上限<br><small class="muted">已并入「高级引擎参数」</small></span><input type="range" id="sConcurrency" min="1" max="256" step="1" value="32"><b class="row-val" id="valConcurrency">32</b></div>
+        <div class="set-row slider-row"><span>CPU 线程数<br><small class="muted">已并入「高级引擎参数」</small></span><input type="range" id="sCpuThreads" min="1" max="64" step="1" value="8"><b class="row-val" id="valCpuThreads">8</b></div>
+        <div class="set-row slider-row"><span>显存预算 GB<br><small class="muted">已并入「高级引擎参数」</small></span><input type="range" id="sVramBudget" min="0" max="24" step="0.5" value="0"><b class="row-val" id="valVramBudget">自动</b></div>
+        <div class="set-row"><span>MoE 后端<br><small class="muted">CPU 模式走 ik_llama.cpp 式 CPU 专家解码，专家全驻内存，显存只跑激活</small></span><select id="sMoeBackend"><option value="auto">auto</option><option value="fused">fused</option><option value="offload" selected>offload · 显存流式（默认）</option><option value="cpu">cpu · 纯内存 CPU</option><option value="hybrid">hybrid · 混合</option><option value="igpu">igpu ★</option></select></div>
+        <div class="set-row hl"><span>稠密模型 FFN 引擎</span><select id="sDenseEngine"><option value="cpu">cpu</option><option value="igpu" selected>igpu</option><option value="gpu">gpu</option></select></div>
+        <div class="set-row hl"><span>iGPU 服务路径</span><input id="sIgpuService" placeholder="留空=内置"></div>
+        <div class="set-row hl"><span>iGPU 无降级</span><input id="sIgpuNoFallback" type="checkbox"></div>
+        <div class="set-row hl"><span>KV 缓存位置</span><select id="sKvDevice"><option value="cuda">显存（严格预算）</option><option value="shared">共享显存池</option><option value="cpu" selected>主存（实验）</option></select></div>
+                <div class="set-row hl"><span>MTP 投机解码</span><input id="sMtp" type="checkbox"></div>
+        <div class="set-row hl"><span>MTP 草稿数 K</span><select id="sMtpK"><option value="1">1（保守）</option><option value="2" selected>2（推荐）</option><option value="3">3</option><option value="4">4</option><option value="5">5（激进）</option></select></div>
+        <div class="set-row hl"><span>MTP head → iGPU FC</span><input id="sMtpIgpuFc" type="checkbox" checked></div>
+        <div class="set-row hl"><span>MTP verify CUDA graph (P0)</span><input id="sMtpIgpuVerifyGraph" type="checkbox"></div><div class="set-row hl"><span>KV 量化</span><select id="sKvQuant"><option value="bf16" selected>BF16（精度最高，内存最大）</option><option value="q8_0">Q8_0（内存减半）</option><option value="q4_0">Q4_0（llama.cpp 32值块，内存1/4）</option></select></div>
+        <div class="set-row hl"><span>推理精度策略</span><select id="sCtFp8"><option value="native" selected>自动（FP8层W8A16 / NVFP4层W4A16）</option><option value="bf16">全部反量化 BF16</option></select></div>
+      </div>
+      <div class="card"><h2 class="card-title">高级引擎参数</h2>
+        <div class="set-row"><span>MoE 显存槽数<br><small class="muted">GPU 专家槽缓存大小（offload/hybrid 模式），默认 256</small></span><input id="sMoeCacheSize" type="number" min="0" step="1" value="256"></div>
+        <div class="set-row"><span>MoE CPU 线程<br><small class="muted">cpu/hybrid 模式的解码工作线程数；0=自动（物理核数）</small></span><input id="sMoeCpuThreads" type="number" min="0" step="1" value="0"></div>
+        <div class="set-row"><span>KV 预算 tokens<br><small class="muted">留空=引擎按剩余显存自动分配；q4_0 建议 262144 (256K)</small></span><input id="sNumTokens" type="number" min="0" step="1" placeholder="自动（按剩余显存）"></div>
+        <div class="set-row slider-row"><span>显存占比<br><small class="muted">引擎可占用的显存比例，默认 0.95</small></span><input type="range" id="sMemoryRatio" min="0.5" max="0.98" step="0.01" value="0.95"><b class="row-val" id="valMemoryRatio">0.95</b></div>
+        <div class="set-row"><span>单请求最大并发<br><small class="muted">默认 4；过高会拉长 CUDA graph 捕获与首载时间</small></span><input id="sMaxRunningReq" type="number" min="1" step="1" value="4"></div>
+        <div class="set-row"><span>预留 KV tokens<br><small class="muted">默认 1024；留默认=引擎自定</small></span><input id="sKvReserveTokens" type="number" min="0" step="1" value="1024"></div>
+        <div class="set-row"><span>禁用 MoE prefill 重叠<br><small class="muted">8GB 卡必须勾选</small></span><input id="sDisableMoePrefillOverlap" type="checkbox" checked></div>
       </div>
     </div>
     <div class="col">

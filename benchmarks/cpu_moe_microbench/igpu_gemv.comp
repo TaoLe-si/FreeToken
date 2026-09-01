@@ -1,0 +1,66 @@
+#version 450
+
+// B 组 iGPU GEMV（W4A8 NVFP4）：每 work-item 算一行
+// y[row] = global * 0.5 * Σ_b e4m3(scale[b]) * asb[b] * Σ_j E2M1x2[nibble] * act
+// 布局：packed 半字节（低 nibble 在前，even = pk[j]&0xF, odd = pk[j]>>4）
+// act 打包：每 uint 4 个 int8（[even0..3][even4..7][odd0..3][odd4..7] 每块 4 uint）
+
+layout(binding = 0) readonly buffer weight_buf { uint packed[]; };
+layout(binding = 1) readonly buffer scale_buf { uint scl[]; };
+layout(binding = 2) readonly buffer act_buf { uint act[]; };
+layout(binding = 3) readonly buffer asb_buf { float asb[]; };
+layout(binding = 4) buffer out_buf { float outv[]; };  // 非 writeonly：输出被后续层消费
+
+layout(push_constant) uniform Params {
+    uint K;          // 行长度（16 的倍数）
+    uint nbPerRow;   // K/16
+    float global;
+} p;
+
+// e2m1*2 LUT（与 CPU 内核 kE2M1x2 一致）
+const int LUT[16] = int[16](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+
+int s8(int b) { int v = b & 0xFF; return v >= 128 ? v - 256 : v; }
+
+void main()
+{
+    const uint row = gl_GlobalInvocationID.x;
+    const uint nb = p.nbPerRow;
+    const uint wbase = row * nb * 2u;   // packed：每块 8 字节 = 2 uint
+    const uint sbase = row * nb;        // scale：每块 1 字节 = 每 4 块 1 uint（按 uint 读）
+    const uint actbase = 0u;            // act 共享
+    const uint ascale = nb;             // asb：每块 1 float
+    float acc = 0.0;
+    for (uint b = 0u; b < nb; ++b) {
+        uint w0 = packed[wbase + b * 2u];
+        uint w1 = packed[wbase + b * 2u + 1u];
+        // scale：uint 数组每元素 4 字节 → 块 b 的 e4m3 在字节 (sbase+b)
+        uint sraw = scl[(sbase + b) >> 2u];
+        int s = int((sraw >> (int((sbase + b) & 3u) * 8)) & 0xFFu);
+        float sign = (s & 0x80) != 0 ? -1.0 : 1.0;
+        int exp = (s >> 3) & 0xF;
+        int man = s & 0x7;
+        float sc;
+        if (exp == 0) sc = sign * float(man) * 0.001953125;
+        else sc = sign * (1.0 + float(man) / 8.0) * exp2(float(exp - 7));
+        float bs = sc * asb[ascale + b];
+        // act 块 b：4 uint（打包 int8）
+        uint a0 = act[actbase + b * 4u];
+        uint a1 = act[actbase + b * 4u + 1u];
+        uint a2 = act[actbase + b * 4u + 2u];
+        uint a3 = act[actbase + b * 4u + 3u];
+        int isum = 0;
+        for (int j = 0; j < 4; ++j) {
+            int byte0 = int((w0 >> (j * 8)) & 0xFFu);
+            int byte1 = int((w1 >> (j * 8)) & 0xFFu);
+            int ae0 = s8(int((a0 >> (j * 8)) & 0xFFu));   // even j
+            int ao0 = s8(int((a2 >> (j * 8)) & 0xFFu));   // odd j
+            int ae1 = s8(int((a1 >> (j * 8)) & 0xFFu));   // even j+4
+            int ao1 = s8(int((a3 >> (j * 8)) & 0xFFu));   // odd j+4
+            isum += LUT[byte0 & 0xF] * ae0 + LUT[byte0 >> 4] * ao0
+                  + LUT[byte1 & 0xF] * ae1 + LUT[byte1 >> 4] * ao1;
+        }
+        acc += bs * float(isum);
+    }
+    outv[row] = acc * p.global * 0.5;
+}

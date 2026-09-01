@@ -32,7 +32,20 @@ class DecodeManager:
     def schedule_next_batch(self) -> Batch | None:
         if not self.runnable:
             return None
-        return Batch(reqs=sorted(self.running_reqs, key=lambda req: req.uid), phase="decode")
+        # Skip reqs that are mid-MTP-verify (req.mtp_verify=True). They were drafted by the
+        # MTP head in the previous decode step and are waiting to be verified as one prefill;
+        # including them in the next decode batch would (a) sample a token from a stale KV
+        # cache that doesn't yet cover the speculative tokens, and (b) re-publish tokens
+        # that _mtp_process_verify is about to ship on its own channel. The scheduler
+        # routes them through _build_mtp_verify_batch -> _schedule_next_batch instead.
+        decode_reqs = [r for r in self.running_reqs if not getattr(r, "mtp_verify", False)]
+        if not decode_reqs:
+            # Every running req is mid-MTP-verify: its verify batch (built by
+            # _build_mtp_verify_batch) is either in flight or about to be -- an
+            # empty decode Batch here would trip pad_batch's next() (size 0,
+            # can_use_cuda_graph True) and crash the scheduler.
+            return None
+        return Batch(reqs=sorted(decode_reqs, key=lambda req: req.uid), phase="decode")
 
     @property
     def runnable(self) -> bool:

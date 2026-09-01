@@ -105,6 +105,10 @@ class ServerArgs(SchedulerConfig):
     gpu: tuple[str, ...] = ()
     # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
     gpu_assigned: "tuple[str, ...] | None" = None
+    # Bounded request lifetime: a generation that produces no terminal reply within this
+    # many seconds is aborted engine-side and the API layer surfaces a generation error.
+    # Guards against a lost/stuck backend reply stranding the client stream forever.
+    request_timeout_s: float = 600.0
 
     @property
     def share_tokenizer(self) -> bool:
@@ -367,6 +371,14 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--request-timeout-s",
+        type=float,
+        dest="request_timeout_s",
+        default=ServerArgs.request_timeout_s,
+        help="Abort a generation that produces no terminal reply within this many seconds.",
+    )
+
+    parser.add_argument(
         "--cuda-graph-max-bs",
         "--graph",
         type=int,
@@ -621,6 +633,56 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--mtp",
+        action="store_true",
+        dest="mtp",
+        default=ServerArgs.mtp,
+        help=(
+            "Enable MTP (Multi-Token Prediction) speculative decoding. Loads the MTP head"
+            " from a Qwen3.5/3.6 checkpoint's mtp.* block (no-op on other architectures)"
+            " and runs K autoregressive draft steps per decode round; the main model"
+            " verifies the K+1 candidates in one prefill-style forward and accepts up to"
+            " K+1. Greedy sampling only (temperature=0 or top_k=1)."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-k",
+        type=int,
+        default=ServerArgs.mtp_k,
+        help=(
+            "Number of speculative drafts per MTP step (default 3; range 1..5). The MTP"
+            " head runs K autoregressive steps before the main model verifies, so each"
+            " accepted batch is up to K+1 tokens."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-igpu-fc",
+        action="store_true",
+        dest="mtp_igpu_fc",
+        default=ServerArgs.mtp_igpu_fc,
+        help=(
+            "Route the MTP head's MXFP4 fc GEMV through the iGPU D3D12 service when"
+            " available (sticky full-weight upload). Falls back to the dGPU torch path"
+            " if the iGPU service is absent."
+        ),
+    )
+    parser.add_argument("--no-mtp-igpu-fc", dest="mtp_igpu_fc", action="store_false", help="Force the dGPU torch reference fc (debug/parity check against the iGPU path)")
+    # G.3: MTP verify CUDA-graph capture. Collapses ~265 kernel launches into
+    # 1 dispatch for ~50-200x launch overhead reduction on the MTP verify path.
+    parser.add_argument(
+        "--mtp-igpu-verify-graph",
+        action="store_true",
+        dest="mtp_igpu_verify_graph",
+        default=ServerArgs.mtp_igpu_verify_graph,
+        help=(
+            "Enable CUDA-graph capture of the 24-layer Qwen3_5Model.forward on MTP verify"
+            " batches (G.3). Requires --mtp-igpu-fc. Disabled by default (capture takes"
+            " ~1-2s on first verify batch)."
+        ),
+    )
+    parser.add_argument("--no-mtp-igpu-verify-graph", dest="mtp_igpu_verify_graph", action="store_false", help="Disable the MTP verify CUDA-graph capture (fall back to eager forward).")
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
@@ -863,6 +925,18 @@ def _build_option_schema() -> dict:
     igpu = parser.add_argument_group("iGPU D3D12")
     igpu.add_argument("--igpu-service", type=str, default=None, help="iGPU D3D12 service exe")
     igpu.add_argument("--igpu-no-fallback", action="store_true", default=False, help="Fail instead of falling back to CPU")
+    # MTP speculative decoding
+    mtp = parser.add_argument_group("MTP speculative decoding")
+    mtp.add_argument("--mtp", action="store_true", default=False, help="Enable MTP (Multi-Token Prediction) speculative decoding")
+    mtp.add_argument("--mtp-k", type=int, default=3, help="Number of speculative drafts per MTP step (1..5)")
+    # P2.1 (2026-09-02): default is now dGPU bf16 F.linear (DgpuBf16Fc, ~75 us/call) --
+    # the iGPU D3D12 sticky bridge is ~1056 us/call (D3D12 stdin/stdout + GPU fence
+    # sync) and was the main MTP-verify bottleneck. Pass --mtp-igpu-fc to force the
+    # legacy iGPU path for A/B comparison or iGPU-specific workloads.
+    mtp.add_argument("--mtp-igpu-fc", action="store_true", default=False, help="[P2.1 deprecated] Force the iGPU D3D12 sticky FC (legacy, ~14x slower than dGPU F.linear)")
+    mtp.add_argument("--no-mtp-igpu-fc", dest="mtp_igpu_fc", action="store_false", help="[P2.1 default] Use the dGPU bf16 F.linear FC executor (DgpuBf16Fc)")
+    mtp.add_argument("--mtp-igpu-verify-graph", action="store_true", default=False, help="Enable CUDA-graph capture of the 24-layer Qwen3_5Model.forward on MTP verify batches (G.3; collapses ~265 launches into 1 dispatch). Requires --mtp-igpu-fc.")
+    mtp.add_argument("--no-mtp-igpu-verify-graph", dest="mtp_igpu_verify_graph", action="store_false", help="Disable the MTP verify CUDA-graph capture (fall back to eager forward).")
 
     out: dict[str, dict] = {}
     for group in parser._action_groups:

@@ -225,7 +225,11 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        # MTP verify batches are phase=prefill but tiny (K+1 tokens) and may run inside
+        # a CUDA graph capture: the prefill streaming path uses events + cross-stream
+        # waits (illegal during capture). Route verify to the capture-safe decode path.
+        _is_verify = getattr(ctx.batch, "mtp_verify", False)
+        if ctx.batch.is_prefill and not _is_verify:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
@@ -245,7 +249,9 @@ class OffloadMoELayer(MoELayer):
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         """
         ctx = get_global_ctx()
-        if ctx.batch.is_prefill:
+        # MTP verify: see OffloadMoELayer.forward -- decode path is capture-safe.
+        _is_verify = getattr(ctx.batch, "mtp_verify", False)
+        if ctx.batch.is_prefill and not _is_verify:
             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)

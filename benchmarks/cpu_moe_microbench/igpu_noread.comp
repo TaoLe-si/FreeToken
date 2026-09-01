@@ -1,0 +1,10 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(binding = 0) writeonly buffer c_blob { float c_blob_data[]; };
+void main() {
+    const uint gx = gl_GlobalInvocationID.x;
+    float c = float(gx) * 1.0001;
+    c = c * 1.5 + 0.25;
+    c = c * c - c;
+    c_blob_data[gx] = c;
+}

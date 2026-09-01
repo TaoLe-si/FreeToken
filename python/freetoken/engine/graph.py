@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import gc
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Dict, List, Optional
 
+import os
 import torch
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
@@ -28,10 +29,15 @@ class GraphCaptureBuffer:
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
     # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
+    # MTP-only: prev_hidden (per-req last-row pre-norm hidden) and all_hidden
+    # (full [bs, hidden] pre-norm hidden). Populated only when the model exposes
+    # a forward_with_hidden() entry point AND capture uses it (see _capture_graphs).
+    prev_hidden: Optional[torch.Tensor] = None
+    all_hidden: Optional[torch.Tensor] = None
 
     @classmethod
-    def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
-        return GraphCaptureBuffer(
+    def init(cls, bs: int, vocab_size: int, device: torch.device, hidden_size: int = 0) -> 'GraphCaptureBuffer':
+        out = GraphCaptureBuffer(
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
             out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
             positions=torch.zeros(bs, dtype=torch.int32, device=device),
@@ -39,6 +45,13 @@ class GraphCaptureBuffer:
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
             fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
         )
+        if hidden_size > 0:
+            # Model-dtype (bf16) buffers: prev_hidden/all_hidden hold the raw pre-norm
+            # hidden the MTP head consumes. f32 here would silently change the MTP input
+            # dtype between the eager path (bf16 raw) and the replay path (upcast f32).
+            out.prev_hidden = torch.zeros(bs, hidden_size, dtype=torch.bfloat16, device=device)
+            out.all_hidden = torch.zeros(bs, hidden_size, dtype=torch.bfloat16, device=device)
+        return out
 
     def set_batch(self, batch: Batch) -> None:
         from freetoken.attention.linear import FLAMetadata
@@ -70,9 +83,15 @@ def _determine_cuda_graph_bs(
     cuda_graph_max_bs: int | None,
     free_memory: int,
 ) -> List[int]:
-    # JIT 修复：优先使用预编译内核缓存，避免 VS2026 + CUDA13 cudafe++ 崩溃
-    # 预编译内核缓存由 freetoken-kernel-cache 包提供，load_jit 会自动查找
-    return []  # FreeToken fix: skip graph capture with PyTorch fallback (slow but functional)
+    # Re-enabled CUDA graph capture: the freetoken-kernel-cache package ships pre-
+    # compiled kernels that sidestep the VS2026 + CUDA13 cudafe++ JIT crash that
+    # originally motivated disabling capture. CUDA graph itself is a PyTorch CUDA API
+    # (no nvcc/JIT involved) -- it just records/replays kernel launches -- so the pre-
+    # compiled kernel cache is enough to make capture safe on this build. For decode-
+    # shaped batches (graph_runner.can_use_cuda_graph: is_decode + size <= max_graph_bs)
+    # the runner captures once per batch size and replays, cutting per-step kernel-
+    # launch overhead by ~30-50% on RTX-class GPUs. MTP verify (is_decode=False) is
+    # unaffected: it stays on the eager Python forward path.
     free_memory_gb = free_memory / (1 << 30)
     if cuda_graph_max_bs is None:
         if free_memory_gb > 80:  # H200
@@ -145,16 +164,55 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
+        # MTP heads (Qwen3.6 hybrid) require model.forward_with_hidden() to return
+        # prev_hidden / all_hidden for the next MTP draft. Capture that entry point when
+        # available so the MTP decode path can also replay the captured graph instead of
+        # running the 24-layer loop eagerly (otherwise MTP decode is ~30 s per step vs
+        # ~70 ms with the graph).
+        has_fwh = hasattr(model, 'forward_with_hidden')
+        fwh = getattr(model, 'forward_with_hidden', None)
+        hidden_size = getattr(getattr(model, 'model', None), 'embed_tokens', None)
+        hidden_size = hidden_size.embedding_dim if hidden_size is not None and hasattr(hidden_size, 'embedding_dim') else 0
+        self._captures_hidden = bool(has_fwh)
+
+        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device, hidden_size=hidden_size if has_fwh else 0)
         self._reset_moe_offload_cache()
 
+        emit_progress("Preparing for capturing CUDA graphs...", 0, 0)
+        pool = None
+        # Phase 1: eager warmup for EVERY size first. The bs=4 warmup allocates the
+        # largest activations; doing all warmups before any capture means the cached
+        # allocator already holds every segment the captures need, so the capture
+        # phase allocates nothing new. Capturing at 0 free VRAM wedges WDDM.
+        for bs in sorted(self.graph_bs_list, reverse=True):
+            batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
+            batch.padded_reqs = batch.reqs
+            self.attn_backend.prepare_for_capture(batch)
+            self.buffer.set_batch(batch)
+            dummy_slot = (self.dummy_req.linear_slot_idx
+                          if self.dummy_req.linear_slot_idx is not None
+                          else self.dummy_req.table_idx)
+            self.buffer.table_idx[:bs].fill_(dummy_slot)
+            with get_global_ctx().forward_batch(batch):
+                if has_fwh:
+                    _logits, _ph, _ah = fwh()
+                    self.buffer.logits[:bs] = _logits
+                    if self.buffer.prev_hidden is not None:
+                        self.buffer.prev_hidden[:bs] = _ph
+                    if self.buffer.all_hidden is not None:
+                        self.buffer.all_hidden[:bs] = _ah
+                else:
+                    self.buffer.logits[:bs] = model.forward()
+            self._reset_moe_offload_cache()
+        torch.cuda.empty_cache()
+
+        # Phase 2: capture each size, reusing one graph memory pool.
         pbar = tqdm(
             sorted(self.graph_bs_list, reverse=True),
-            desc="Preparing for capturing CUDA graphs...",
+            desc="Capturing CUDA graphs",
             unit="batch",
-            disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
+            disable=not get_tp_info().is_primary(),
         )
-        pool = None
         for bs in pbar:
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
@@ -164,37 +222,62 @@ class GraphRunner:
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
-            # capture on the dummy linear-state slot so GatedDeltaNet gather/scatter
-            # touches scratch (real slot indices are written by copy_from on replay). Hybrid-
-            # radix decouples the GDN slot from table_idx -> use the GDN padding slot.
             dummy_slot = (self.dummy_req.linear_slot_idx
                           if self.dummy_req.linear_slot_idx is not None
                           else self.dummy_req.table_idx)
             self.buffer.table_idx[:bs].fill_(dummy_slot)
             with get_global_ctx().forward_batch(batch):
-                self.buffer.logits[:bs] = model.forward()
-                # Keep the offload cache warmed for capture. Resetting here forces
-                # CUDA graph capture to replay cold-cache expert copies.
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                    self.buffer.logits[:bs] = model.forward()
+                if has_fwh:
+                    with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                        _logits, _ph, _ah = fwh()
+                        self.buffer.logits[:bs] = _logits
+                        if self.buffer.prev_hidden is not None:
+                            self.buffer.prev_hidden[:bs] = _ph
+                        if self.buffer.all_hidden is not None:
+                            self.buffer.all_hidden[:bs] = _ah
+                else:
+                    with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                        self.buffer.logits[:bs] = model.forward()
                 self._reset_moe_offload_cache()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
+            # NOTE: no empty_cache() here -- the warmup-then-capture order means the
+            # allocator retains the warmup segments for the real prefill to reuse.
+            # Freeing them pushes post-capture forwards into WDDM shared memory
+            # (driver page-thrash = multi-minute "hangs").
+
 
         self._reset_moe_offload_cache()
+        # Release the eager-warmup segments now: replays execute from the graph pool,
+        # and the freed blocks become real free VRAM for request-time triton module
+        # loads and prefill activations (zero-free VRAM wedges WDDM).
+        torch.cuda.empty_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        if os.environ.get("FT_SKIP_CUDA_GRAPH"):
+            return False
+        # Empty graph list => graphs disabled entirely: never true (a size-0 decode
+        # batch would otherwise take the next() path in pad_batch -> StopIteration).
+        return bool(self.graph_bs_list) and batch.is_decode and batch.size <= self.max_graph_bs
 
-    def replay(self, batch: Batch) -> torch.Tensor:
+    def replay(self, batch: Batch):
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
+        if self._captures_hidden:
+            # MTP enabled: also return the captured prev_hidden / all_hidden slices so
+            # the engine can feed them to the MTP head's next draft. Both tensors live
+            # in the persistent buffer and are valid until the next replay call.
+            return (
+                self.buffer.logits[: batch.size],
+                self.buffer.prev_hidden[: batch.size] if self.buffer.prev_hidden is not None else None,
+                self.buffer.all_hidden[: batch.size] if self.buffer.all_hidden is not None else None,
+            )
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:

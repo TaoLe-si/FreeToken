@@ -117,7 +117,19 @@ def resolve_moe_cache_auto(
     CUDA-graph/activation headroom (not subtracted here).
     """
     budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
-    max_slots = 992 if quant_format == "nvfp4_marlin" else total_experts
+    # Design mandate ("VRAM = active 3B + working set; experts live in RAM"): reserve an
+    # explicit activation + CUDA-graph headroom BEFORE greedily filling expert slots.
+    # Without it the slot cache gobbles the last few hundred MB and the first real
+    # forward spills into WDDM shared memory (driver page-thrash = multi-minute hangs).
+    # 12% of baseline, floored at 512 MiB, matches the sizes that historically worked.
+    headroom_bytes = max(512 * 1024 * 1024, int(baseline_free * 0.12))
+    budget_bytes -= headroom_bytes
+    # Design mandate: the slot cache is a HOT SET, not a pool to greedily fill. Cap it
+    # at 640 slots (~0.94 GiB at 1.5 MiB/slot) so the bulk of the 10k experts stays in
+    # the RAM banks (already resident there) and VRAM keeps room for activations, KV
+    # and CUDA-graph pools. Users can override with --moe-cache-size.
+    auto_slot_cap = 1150
+    max_slots = min(992 if quant_format == "nvfp4_marlin" else total_experts, auto_slot_cap)
     kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
     return plan_cache_budget(
         budget_bytes=budget_bytes,

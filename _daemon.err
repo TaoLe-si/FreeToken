@@ -1,0 +1,393 @@
+E:\FreeToken\python\freetoken\daemon\serve_manager.py:501: SyntaxWarning: invalid escape sequence '\$'
+  "Where-Object { \$_.CommandLine -match 'freetoken\\.cli serve|multiprocessing\\.spawn' } | "
+E:\FreeToken\python\freetoken\daemon\serve_manager.py:502: SyntaxWarning: invalid escape sequence '\$'
+  "ForEach-Object { Stop-Process -Id \$(\$_.ProcessId) -Force }"],
+2026-08-25 19:38:23,937 [ft-daemon] INFO ft daemon 0.1.1+g30aa89115 listening on 127.0.0.1:1900 (state-dir=C:\Users\Administrator\.freetoken\daemon)
+INFO:     Started server process [27984]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:1900 (Press CTRL+C to quit)
+2026-08-25 19:39:42,510 [ft-daemon] INFO ft daemon 0.1.1+g30aa89115 listening on 127.0.0.1:1900 (state-dir=C:\Users\Administrator\.freetoken\daemon)
+INFO:     Started server process [26092]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:1900 (Press CTRL+C to quit)
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 19:40:42,136 [ft-daemon] INFO ft daemon 0.1.1+g30aa89115 listening on 127.0.0.1:1900 (state-dir=C:\Users\Administrator\.freetoken\daemon)
+INFO:     Started server process [7960]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:1900 (Press CTRL+C to quit)
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 19:43:47,732 [ft-daemon] INFO ft daemon 0.1.1+g30aa89115 listening on 127.0.0.1:1900 (state-dir=C:\Users\Administrator\.freetoken\daemon)
+INFO:     Started server process [15444]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:1900 (Press CTRL+C to quit)
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+Traceback (most recent call last):
+  File "E:\FreeToken\python\freetoken\daemon\app.py", line 1470, in engine_start
+    return await run(lifecycle_pool, manager.start, body.model, port, _normalize_engine_args(body.model, body.args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\FreeToken\python\freetoken\daemon\app.py", line 662, in run
+    return await loop.run_in_executor(pool, functools.partial(fn, *args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\concurrent\futures\thread.py", line 59, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\FreeToken\python\freetoken\daemon\serve_manager.py", line 378, in start
+    return self._start(model, port, args, _auto=_auto)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\FreeToken\python\freetoken\daemon\serve_manager.py", line 522, in _start
+    child = self._spawn_fn(model, port, args)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\FreeToken\python\freetoken\daemon\serve_manager.py", line 355, in _default_spawn
+    return spawn_serve(argv, log_path)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\FreeToken\python\freetoken\daemon\serve_manager.py", line 248, in spawn_serve
+    if getattr(self, "_spill_next", False):
+               ^^^^
+NameError: name 'self' is not defined
+2026-08-25 19:44:29,958 [ft-daemon] INFO ft daemon 0.1.1+g30aa89115 listening on 127.0.0.1:1900 (state-dir=C:\Users\Administrator\.freetoken\daemon)
+INFO:     Started server process [9892]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:1900 (Press CTRL+C to quit)
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 20:51:21,448 [ft-daemon] INFO ft daemon 0.1.1+g30aa89115 listening on 127.0.0.1:1900 (state-dir=C:\Users\Administrator\.freetoken\daemon)
+INFO:     Started server process [6080]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:1900 (Press CTRL+C to quit)
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 20:51:41,075 [ft-daemon] WARNING backend down (RuntimeError: Promotion for Float8 Types is not supported, attempted to promote Float8_e4m3fn and BFloat16); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 20:52:06,143 [ft-daemon] WARNING backend down (RuntimeError: Promotion for Float8 Types is not supported, attempted to promote Float8_e4m3fn and BFloat16); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 20:52:31,226 [ft-daemon] WARNING backend down (RuntimeError: Promotion for Float8 Types is not supported, attempted to promote Float8_e4m3fn and BFloat16); restarting serve once
+2026-08-25 20:52:31,226 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+2026-08-25 20:54:48,276 [ft-daemon] INFO ft daemon 0.1.1+g30aa89115 listening on 127.0.0.1:1900 (state-dir=C:\Users\Administrator\.freetoken\daemon)
+INFO:     Started server process [7288]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:1900 (Press CTRL+C to quit)
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 20:56:58,110 [ft-daemon] WARNING backend down (RuntimeError: Promotion for Float8 Types is not supported, attempted to promote Float8_e4m3fn and BFloat16); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 20:57:38,178 [ft-daemon] WARNING backend down (RuntimeError: Promotion for Float8 Types is not supported, attempted to promote Float8_e4m3fn and BFloat16); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 20:58:03,224 [ft-daemon] WARNING backend down (RuntimeError: Promotion for Float8 Types is not supported, attempted to promote Float8_e4m3fn and BFloat16); restarting serve once
+2026-08-25 20:58:03,224 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 21:11:26,187 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 340.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 22.); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 21:12:23,821 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 340.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 22.); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 21:13:19,816 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 340.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 22.); restarting serve once
+2026-08-25 21:13:19,817 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 21:31:13,164 [ft-daemon] WARNING backend down (AssertionError: ); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 21:32:29,959 [ft-daemon] WARNING backend down (AssertionError: ); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 21:33:45,950 [ft-daemon] WARNING backend down (AssertionError: ); restarting serve once
+2026-08-25 21:33:45,951 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 21:42:13,447 [ft-daemon] WARNING backend down (AssertionError: Not enough memory for KV cache, try reducing --num-pages); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 21:43:40,253 [ft-daemon] WARNING backend down (AssertionError: Not enough memory for KV cache, try reducing --num-pages); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 21:44:52,029 [ft-daemon] WARNING backend down (AssertionError: Not enough memory for KV cache, try reducing --num-pages); restarting serve once
+2026-08-25 21:44:52,029 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 21:46:13,904 [ft-daemon] WARNING backend down (AssertionError: Not enough memory for KV cache, try reducing --num-pages); restarting serve once
+2026-08-25 21:46:13,905 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 21:50:01,009 [ft-daemon] WARNING backend down (AssertionError: Not enough memory for KV cache, try reducing --num-pages); restarting serve once
+2026-08-25 21:50:01,010 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 22:06:59,268 [ft-daemon] INFO ft daemon 0.1.1+g30aa89115 listening on 127.0.0.1:1900 (state-dir=C:\Users\Administrator\.freetoken\daemon)
+INFO:     Started server process [19104]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:1900 (Press CTRL+C to quit)
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 22:21:30,248 [ft-daemon] WARNING backend down (AssertionError: Not enough memory for KV cache, try reducing --num-pages); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 22:23:12,106 [ft-daemon] WARNING backend down (AssertionError: Not enough memory for KV cache, try reducing --num-pages); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 22:24:48,200 [ft-daemon] WARNING backend down (AssertionError: Not enough memory for KV cache, try reducing --num-pages); restarting serve once
+2026-08-25 22:24:48,200 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+2026-08-25 22:33:39,767 [ft-daemon] INFO ft daemon 0.1.1+g30aa89115 listening on 127.0.0.1:1900 (state-dir=C:\Users\Administrator\.freetoken\daemon)
+INFO:     Started server process [2844]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:1900 (Press CTRL+C to quit)
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 22:34:54,651 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 256.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 22:51:33,872 [ft-daemon] INFO HTTP Request: GET http://127.0.0.1:19200/v1/models "HTTP/1.1 200 OK"
+2026-08-25 22:51:35,229 [ft-daemon] INFO HTTP Request: GET http://127.0.0.1:19200/v1/models "HTTP/1.1 200 OK"
+2026-08-25 22:51:35,240 [ft-daemon] INFO HTTP Request: POST http://127.0.0.1:19200/v1/chat/completions "HTTP/1.1 200 OK"
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpx\_transports\default.py", line 101, in map_httpcore_exceptions
+    yield
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpx\_transports\default.py", line 127, in __iter__
+    for part in self._httpcore_stream:
+                ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpcore\_sync\connection_pool.py", line 407, in __iter__
+    raise exc from None
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpcore\_sync\connection_pool.py", line 403, in __iter__
+    for part in self._stream:
+                ^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpcore\_sync\http11.py", line 342, in __iter__
+    raise exc
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpcore\_sync\http11.py", line 334, in __iter__
+    for chunk in self._connection._receive_response_body(**kwargs):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpcore\_sync\http11.py", line 203, in _receive_response_body
+    event = self._receive_event(timeout=timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpcore\_sync\http11.py", line 213, in _receive_event
+    with map_exceptions({h11.RemoteProtocolError: RemoteProtocolError}):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\contextlib.py", line 158, in __exit__
+    self.gen.throw(value)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpcore\_exceptions.py", line 14, in map_exceptions
+    raise to_exc(exc) from exc
+httpcore.RemoteProtocolError: peer closed connection without sending complete message body (incomplete chunked read)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\uvicorn\protocols\http\h11_impl.py", line 416, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\uvicorn\middleware\proxy_headers.py", line 63, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\fastapi\applications.py", line 1163, in __call__
+    await super().__call__(scope, receive, send)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\applications.py", line 96, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\middleware\errors.py", line 186, in __call__
+    raise exc
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\middleware\errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\middleware\exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\fastapi\middleware\asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\routing.py", line 670, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\fastapi\routing.py", line 2734, in app
+    await route.handle(scope, receive, send)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\fastapi\routing.py", line 1281, in handle
+    await super().handle(scope, receive, send)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\routing.py", line 280, in handle
+    await self.app(scope, receive, send)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\fastapi\routing.py", line 158, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\fastapi\routing.py", line 145, in app
+    await response(scope, receive, send)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\responses.py", line 273, in __call__
+    async with create_collapsing_task_group() as task_group:
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\contextlib.py", line 231, in __aexit__
+    await self.gen.athrow(value)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\_utils.py", line 93, in create_collapsing_task_group
+    raise exc from exc.__cause__ or context
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\anyio\_core\_tasks.py", line 275, in _run_coro
+    retval = await self._coro
+             ^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\responses.py", line 276, in wrap
+    await func()
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\responses.py", line 250, in stream_response
+    async for chunk in self.body_iterator:
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\concurrency.py", line 57, in iterate_in_threadpool
+    yield await anyio.to_thread.run_sync(_next, as_iterator)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\anyio\to_thread.py", line 65, in run_sync
+    return await get_async_backend().run_sync_in_worker_thread(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 2641, in run_sync_in_worker_thread
+    return await future
+           ^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\anyio\_backends\_asyncio.py", line 1033, in run
+    result = context.run(func, *args)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\starlette\concurrency.py", line 46, in _next
+    return next(iterator)
+           ^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpx\_models.py", line 951, in iter_raw
+    for raw_stream_bytes in self.stream:
+                            ^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpx\_client.py", line 153, in __iter__
+    for chunk in self._stream:
+                 ^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpx\_transports\default.py", line 126, in __iter__
+    with map_httpcore_exceptions():
+         ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Administrator\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\contextlib.py", line 158, in __exit__
+    self.gen.throw(value)
+  File "C:\Users\Administrator\AppData\Local\freeToken\venv\Lib\site-packages\httpx\_transports\default.py", line 118, in map_httpcore_exceptions
+    raise mapped_exc(message) from exc
+httpx.RemoteProtocolError: peer closed connection without sending complete message body (incomplete chunked read)
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:03:56,070 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:05:12,862 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:06:24,720 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+2026-08-25 23:06:24,721 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:12:01,940 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:14:44,068 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:16:10,928 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+2026-08-25 23:16:10,929 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:24:38,398 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:25:45,231 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:26:47,081 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+2026-08-25 23:26:47,082 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:32:04,327 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:33:21,222 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-25 23:34:23,061 [ft-daemon] WARNING backend down (OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 23.4); restarting serve once
+2026-08-25 23:34:23,062 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python
+2026-08-26 00:44:05,292 [ft-daemon] WARNING backend down (__unreachable__: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>); restarting serve once
+2026-08-26 00:44:07,330 [ft-daemon] ERROR restart failed: prepare-stop request failed: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>
+2026-08-26 00:44:16,404 [ft-daemon] WARNING backend down (__unreachable__: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>); restarting serve once
+2026-08-26 00:44:18,435 [ft-daemon] ERROR restart failed: prepare-stop request failed: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>
+2026-08-26 00:44:27,507 [ft-daemon] WARNING backend down (__unreachable__: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>); restarting serve once
+2026-08-26 00:44:27,507 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+2026-08-26 00:44:36,587 [ft-daemon] WARNING backend down (__unreachable__: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>); restarting serve once
+2026-08-26 00:44:36,587 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+2026-08-26 00:44:45,675 [ft-daemon] WARNING backend down (__unreachable__: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>); restarting serve once
+2026-08-26 00:44:45,675 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+2026-08-26 00:44:54,776 [ft-daemon] WARNING backend down (__unreachable__: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>); restarting serve once
+2026-08-26 00:44:54,776 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+2026-08-26 00:45:03,850 [ft-daemon] WARNING backend down (__unreachable__: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>); restarting serve once
+2026-08-26 00:45:03,850 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+2026-08-26 00:45:12,930 [ft-daemon] WARNING backend down (__unreachable__: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>); restarting serve once
+2026-08-26 00:45:12,930 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+2026-08-26 00:45:22,005 [ft-daemon] WARNING backend down (__unreachable__: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>); restarting serve once
+2026-08-26 00:45:22,005 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+2026-08-26 00:45:31,064 [ft-daemon] WARNING backend down (__unreachable__: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>); restarting serve once
+2026-08-26 00:45:31,064 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+2026-08-26 00:45:40,137 [ft-daemon] WARNING backend down (__unreachable__: <urlopen error [WinError 10061] 由于目标计算机积极拒绝，无法连接。>); restarting serve once
+2026-08-26 00:45:40,137 [ft-daemon] ERROR restart failed: name '_evt' is not defined
+[serve] JIT toolchain PATH prepended: C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64, C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64, C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0\bin
+[serve] engine dev tree: E:\FreeToken\python

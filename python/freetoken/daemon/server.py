@@ -55,7 +55,6 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
     p.add_argument("--poll-interval", type=float, default=1.0, help="Adopted-serve liveness / OOM reapply interval")
     p.add_argument("--oom-child-score", type=int, default=500, help="oom_score_adj written to the serve tree")
     p.add_argument("--no-oom", action="store_true", help="Do not manage oom_score_adj")
-    p.add_argument("--auto-restart", action="store_true", help="Restart the serve on crash (default off)")
     p.add_argument("--stop-serve-on-exit", action="store_true", help="Stop the serve when the daemon exits (default: detach, engine outlives the daemon)")
     p.add_argument("--log-capacity", type=int, default=4000, help="Log ring size (lines)")
     p.add_argument("--setsid", action="store_true", help="Detach into a new session at startup (guarded)")
@@ -87,9 +86,9 @@ def _install_signal_hygiene(setsid: bool) -> None:
 def _start_backend_watchdog(manager, interval: float, stop: threading.Event) -> threading.Thread:
     """The engine's own /health is the single source of truth. When the backend planner
     dies but uvicorn lingers, health reports status=error while the process looks alive.
-    Restart the generation once (VRAM-settled by ServeManager), else stop the zombie so
-    every client sees the truth instead of a phantom 已加载."""
-    _recover_times: list[float] = []   # 熔断：6 分钟滑动窗内 RECOVER 计数
+    NO auto-restart (removed on request): the watchdog only STOPS the zombie so every
+    client sees the truth instead of a phantom 已加载. A failed engine stays down until
+    the user explicitly starts it again."""
     import json as _json
     import urllib.request as _ur
 
@@ -106,7 +105,6 @@ def _start_backend_watchdog(manager, interval: float, stop: threading.Event) -> 
             return "__unreachable__: %s" % exc
 
     def _run():
-        tried = None
         import os as _os
         _dbg = _os.path.join(_os.environ.get("LOCALAPPDATA", ""), "freeToken", "wdg.log")
         def _dbg_log(msg):
@@ -116,8 +114,9 @@ def _start_backend_watchdog(manager, interval: float, stop: threading.Event) -> 
                     f.write(msg + "\n")
             except Exception:  # noqa: BLE001
                 pass
-        _dbg_log("watchdog armed")
+        _dbg_log("watchdog armed (no-restart)")
         ever_healthy = set()          # pids that answered /health at least once
+        stopped = set()               # pids this watchdog already stopped
         while not stop.wait(interval):
             try:
                 st = manager.status()
@@ -135,35 +134,22 @@ def _start_backend_watchdog(manager, interval: float, stop: threading.Event) -> 
                 if (err.startswith("__unreachable__") and pid not in ever_healthy
                         and uptime < 150 and not st.get("adopted")):
                     continue
-                key = (pid, st.get("model"))
-                if tried == key or (isinstance(tried, tuple) and len(tried) == 3 and tried[1:] == key):
-                    manager.stop()
-                    logger.error("backend still failing (%s); serve stopped", str(err)[:120])
+                # Backend is genuinely down: stop it once, report, and stay down.
+                if pid in stopped:
                     continue
-                logger.warning("backend down (%s); restarting serve once", str(err)[:160])
-                _dbg_log("RECOVER pid=%s reason=%s" % (pid, str(err)[:100]))
+                logger.error("backend down (%s); serve stopped (no auto-restart)", str(err)[:160])
+                _dbg_log("STOP pid=%s reason=%s" % (pid, str(err)[:100]))
                 try:
-                    import time as _tmod
-                    _nowm=_tmod.monotonic(); _recover_times.append(_nowm)
-                    while _recover_times and (_nowm-_recover_times[0])>360: _recover_times.pop(0)
-                    if len(_recover_times)>=3:
-                        try:
-                            from freetoken.daemon.serve_manager import _evt
-                            _evt("circuit OPEN: repeated recover, stopping")
-                        except Exception:
-                            logger.error("circuit OPEN: repeated recover, stopping")
-                        try: manager.stop()
-                        except Exception: pass
-                        return
-                    manager.restart()
-                    tried = key
-                except Exception as ex:
-                    logger.error("restart failed: %s", ex)
                     manager.stop()
-                    tried = ("gaveup",) + tuple(key or ())
+                    stopped.add(pid)
+                except Exception as ex:  # noqa: BLE001
+                    logger.error("stop of failed backend failed: %s", ex)
             except Exception:  # noqa: BLE001
                 pass
     t = threading.Thread(target=_run, name="ft-daemon-backend-watchdog", daemon=True)
+    t.start()
+    return t
+
     t.start()
     return t
 
@@ -232,7 +218,6 @@ def main(argv: Sequence[str] | None = None, *, prog: str = "ft daemon") -> int:
         poll_interval_s=args.poll_interval,
         oom_child_score=args.oom_child_score,
         apply_oom=not args.no_oom,
-        auto_restart=args.auto_restart,
         python=args.serve_python,
         log_dir=log_dir,
         prepare_stop=probe.prepare_stop,

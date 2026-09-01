@@ -28,7 +28,15 @@ class SamplingParams:
 
     @property
     def is_greedy(self) -> bool:
-        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+        # NOTE: top_p deliberately does not gate this. A caller that asks for
+        # temperature=0 (argmax) while leaving the model-default top_p<1.0 would
+        # otherwise be classified as "sampling" -- which (a) forces the
+        # temperature/top-k/top-p kernel path with T≈1e-6 instead of plain argmax,
+        # and (b) silently disables MTP speculative decoding, whose verify step
+        # compares draft tokens against the main model's argmax. Top-p filtering
+        # never changes the argmax winner, so temperature<=0 (or top_k==1)
+        # IS greedy regardless of top_p.
+        return self.temperature <= 0.0 or self.top_k == 1
 
 
 @dataclass(eq=False)

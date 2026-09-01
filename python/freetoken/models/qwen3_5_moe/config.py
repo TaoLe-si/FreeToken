@@ -119,10 +119,22 @@ def _attn_quant(hf_config: Any) -> str:
     layers = get("quantized_layers") or {}
     if not isinstance(layers, dict):
         return "none"
+    def _attn_layer(name: str) -> bool:
+        # modelopt tags individual projections (".self_attn.q_proj"); our in-app
+        # MXFP4->NVFP4 conversion tags the whole module (".self_attn", no trailing
+        # component). Accept both.
+        return (".self_attn." in name or ".linear_attn." in name
+                or name.endswith((".self_attn", ".linear_attn")))
+
     for name, spec in layers.items():
         algo = str((spec or {}).get("quant_algo", "")).lower()
-        if algo == "fp8" and (".self_attn." in name or ".linear_attn." in name):
+        if algo == "fp8" and _attn_layer(name):
             return "fp8_pertensor"
+        # W4A16 attention detection (our in-app MXFP4->NVFP4 conversion and any
+        # modelopt export that quantizes attention to NVFP4): route the projections
+        # through the Nvfp4Dense* kernels via the shared factory.
+        if "fp4" in algo and _attn_layer(name):
+            return "nvfp4"
     return "none"
 
 

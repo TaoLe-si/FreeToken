@@ -371,6 +371,13 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # MTP: post-norm hidden of the last position of each req (shape [bs, H], bf16).
+    # None when mtp is disabled or the forward did not capture it (e.g. MTP verify).
+    prev_hidden: "torch.Tensor | None" = None
+    # MTP: the full [total_T, H] post-norm hidden of this forward. Consumed by the
+    # scheduler to seed the MTP head's context KV (prefill) and to re-commit exact
+    # rows for accepted tokens (verify). None for decode batches and when mtp is off.
+    all_hidden: "torch.Tensor | None" = None
 
 
 class Engine:
@@ -424,6 +431,13 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        # G.3: per-engine MTP-verify CUDAGraph backend. Lazy-created on the
+        # first verify batch (its __init__ needs model.parameters() to be on a
+        # real device). Disabled by default -- only built when sMtpIgpuVerify
+        # (or similar flag) is set by the scheduler, since the capture cost
+        # is ~seconds and the win is per-verify-step.
+        self.verify_graph_backend = None
+        self._verify_graph_enabled = bool(getattr(config, "mtp_igpu_verify_graph", False))
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -617,6 +631,11 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        if config.attention_backend.split(",")[0] == "triton":
+            # Prefill runs on the first comma part; warm its autotune cache BEFORE
+            # graph capture: capture eats all free VRAM, and a post-capture prefill
+            # warmup would allocate through the WDDM shared pool and wedge the boot.
+            self._warmup_prefill()
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -630,9 +649,6 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
-        if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
-            self._warmup_prefill()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1271,12 +1287,73 @@ class Engine:
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        import time as _time
+        _t0 = _time.perf_counter()
         assert torch.cuda.current_stream() == self.stream
+        # MTP verify: keep ALL K+1 per-position logits so the engine can argmax each row
+        # (the sampler only supports last-token / single-row sampling). The flag is set
+        # before the forward context so ParallelLMHead / Nvfp4LMHead / Fp8LMHead see it and
+        # skip their last-position gather.
+        is_verify = getattr(batch, "mtp_verify", False)
+        if is_verify:
+            batch.no_lm_head_gather = True
+        # G.3: bind the verify CUDAGraph handle on the batch so Qwen3_5Model.forward
+        # replays instead of running the 24-layer loop. Disabled by default
+        # (self._verify_graph_enabled set in __init__); enable when the scheduler
+        # advertises sMtpIgpuVerify=true. Lazy-create the backend on first use
+        # so we don't pay the init cost on non-MTP runs.
+        #
+        # G.4: the prepare_for_replay call (which lazily captures the graph on first
+        # use per (bs, num_tokens)) MUST run inside ctx.forward_batch so the capture's
+        # model.forward call can read batch.input_ids via get_global_ctx().batch.
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
-                logits = self.graph_runner.replay(batch)
+            if is_verify and self._verify_graph_enabled and getattr(self.config, "mtp", False):
+                if self.verify_graph_backend is None:
+                    from freetoken.attention.model_verify_graph import ModelVerifyGraphBackend
+                    # Pass the inner Qwen3_5Model so the graph captures only the
+                    # 24-layer stack + final norm (no LM head, no sampler).
+                    self.verify_graph_backend = ModelVerifyGraphBackend(self.model.model)
+                self.verify_graph_backend.prepare_for_replay(batch)
+            # Main-decode replay path: skip the 24-layer eager loop by replaying the
+            # captured graph_runner graph (~10 s saved per step). The graph was
+            # captured against the stable GraphCaptureBuffer; we wire its outputs
+            # (prev_hidden / all_hidden) onto the batch so the model.py replay branch
+            # picks them up. (The graph was captured with forward_with_hidden for every size, so ALL decode sizes replay — MTP off just discards the hidden outputs.)
+            if getattr(self.config, "mtp", False) and self.graph_runner is not None:
+                _replay_t = _time.perf_counter() - _t0
+                if (
+                    not is_verify
+                    and not os.environ.get("FT_DISABLE_DECODE_REPLAY")  # replay default-on; opt-out for debug
+                    and self.graph_runner.can_use_cuda_graph(batch)
+                    and getattr(self.graph_runner, "_captures_hidden", False)
+                ):
+                    self.graph_runner.pad_batch(batch)
+                    # Copy live batch data into the stable GraphCaptureBuffer. set_batch
+                    # also rebinds batch.input_ids / .positions / .out_loc / .linear_table_idx
+                    # to views into the buffer so the captured kernels read stable addresses.
+                    self.graph_runner.buffer.copy_from(batch)
+                    self.graph_runner.buffer.set_batch(batch)
+                    self.attn_backend.prepare_for_replay(batch)
+                    batch.mtp_verify_input_buf = self.graph_runner.buffer.input_ids
+                    batch.mtp_prev_hidden_buf = self.graph_runner.buffer.prev_hidden
+                    batch.mtp_all_hidden_buf = self.graph_runner.buffer.all_hidden
+                    batch.mtp_logits_buf = self.graph_runner.buffer.logits
+                    batch.graph_handle = self.graph_runner.graph_map[batch.padded_size]
+                    logits, prev_hidden, all_hidden = self.model.forward_with_hidden()
+                    if all_hidden is not None:
+                        all_hidden = all_hidden[: batch.input_ids.shape[0]].detach()
+                    if prev_hidden is not None:
+                        # CLONE: prev_hidden aliases the persistent GraphCaptureBuffer --
+                        # the NEXT replay would overwrite it before the overlap scheduler
+                        # drains this batch's ForwardOutput. The eager path allocated a
+                        # fresh tensor per call and never had this hazard.
+                        prev_hidden = prev_hidden[:batch.size].detach().clone()
+                else:
+                    logits, prev_hidden, all_hidden = self.model.forward_with_hidden()
             else:
                 logits = self.model.forward()
+                prev_hidden = None
+                all_hidden = None
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1285,12 +1362,30 @@ class Engine:
         for req in batch.reqs:
             req.complete_one()
 
-        batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if is_verify:
+            import os as _os
+            if _os.environ.get("FT_MTP_DEBUG"):
+                print(f"[MTP-dbg] verify batch: size={batch.size} input_rows={batch.input_ids.shape[0]} "
+                      f"logits={tuple(logits.shape)} all_hidden={tuple(all_hidden.shape) if all_hidden is not None else None} "
+                      f"extends={[r.extend_len for r in batch.padded_reqs]}", flush=True)
+            next_tokens_gpu = logits.argmax(dim=-1).to(torch.int32)
+            prev_hidden_out = None  # verify path does not feed the next draft
+            # The per-position hiddens re-commit exact head-KV rows for the
+            # accepted prefix (see MtpDriver.commit_round).
+            all_hidden_out = all_hidden
+        else:
+            batch_logits = logits[: batch.size]
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+            prev_hidden_out = prev_hidden
+            # Prefill hiddens seed the MTP head's context KV at the first draft;
+            # decode rows are already covered by prev_hidden.
+            all_hidden_out = all_hidden if batch.is_prefill else None
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(
+            next_tokens_gpu, next_tokens_cpu, copy_done_event, prev_hidden_out, all_hidden_out
+        )
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -1304,10 +1399,15 @@ class Engine:
         if self.max_seq_len < 2:
             return
 
-        warmup_lens = [min(80, self.max_seq_len)]
+        # Warm BOTH triton specialization classes: lengths divisible by 16 (80/128)
+        # and small/non-divisible ones (1/2/11). The real MTP prefill runs at tiny
+        # K+1-ish token counts (e.g. 11, 22) whose kernels specialize differently;
+        # compiling them lazily at request time spins in cuModuleLoadData when the
+        # post-capture GPU has zero free VRAM (WDDM thrash = minutes-long hang).
+        warmup_lens = [1, 2, 11, min(80, self.max_seq_len)]
         if self.max_seq_len >= 128:
             warmup_lens.append(128)
-        warmup_lens = sorted({length for length in warmup_lens if length >= 2})
+        warmup_lens = sorted({length for length in warmup_lens if length >= 1})
         if not warmup_lens:
             return
 

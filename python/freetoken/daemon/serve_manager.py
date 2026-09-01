@@ -206,6 +206,9 @@ def spawn_serve(
         # installed wheel and argparse dies before writing a single log line.
         # Opt OUT of the dev tree explicitly with FREETOKEN_SERVE_USE_WHEEL=1.
         child_env = dict(os.environ)
+        # Profile MTP path (no-op if FT_MTP_PROF != "1")
+        if os.environ.get("FT_MTP_PROF") == "1":
+            child_env["FT_MTP_PROF"] = "1"
         if os.environ.get("FREETOKEN_SERVE_USE_WHEEL") == "1":
             child_env.pop("PYTHONPATH", None)
             for _pk in ("PYTHONHOME", "PYTHONSTARTUP", "PYTHONEXECUTABLE"):
@@ -263,6 +266,10 @@ def spawn_serve(
             else:
                 child_env["PYTHONPATH"] = _installed_root + os.pathsep + child_env.get("PYTHONPATH", "")
                 print("[serve] engine installed: " + _installed_root, file=sys.stderr)
+            # 内核缓存 wheel 与 dev tree 的版本戳来自不同构建（venv wheel 0.1.2+cu130
+            # vs dev tree stamp 0.1.1+g<sha>），内核已验证兼容；跳过版本戳硬校验，
+            # 否则引擎 load_jit 一启动就 RuntimeError（setdefault 允许外部显式覆盖）。
+            child_env.setdefault("FREETOKEN_DISABLE_KERNEL_CACHE_VERSION_CHECK", "1")
         except Exception:
             pass
         # Merge per-start hints from the manager. env_extra is the only legal channel
@@ -309,7 +316,6 @@ class ServeManager:
         poll_interval_s: float = 1.0,
         oom_child_score: int = 500,
         apply_oom: bool = True,
-        auto_restart: bool = False,
         python: str = sys.executable,
         log_dir: str = ".",
         prepare_stop: Callable[[int], dict[str, Any]] | None = None,
@@ -326,7 +332,6 @@ class ServeManager:
         self._poll_interval_s = poll_interval_s
         self._oom_child_score = oom_child_score
         self._apply_oom = apply_oom
-        self._auto_restart = auto_restart
         self._python = python
         self._log_dir = log_dir
         self._spawn_fn = spawn_fn or self._default_spawn
@@ -1123,11 +1128,8 @@ class ServeManager:
         child.close()
         if is_current:
             self._emit(self._exit_line(child, info, was_stopping))
-            # Auto-restart only a genuine crash, and never one the user has asked to stop.
-            with self._cond:
-                do_restart = not was_stopping and self._auto_restart and not self._stop_requested
-            if do_restart:
-                self._restart_async(child)
+            # No auto-restart on crash (removed on request): the engine stays down until
+            # the user explicitly starts it again.
 
     def _exit_line(self, child, info: ExitInfo, was_stopping: bool) -> str:
         if info.source == "adopted-vanished":
@@ -1137,19 +1139,6 @@ class ServeManager:
         if info.code is not None and info.code < 0:
             return f"serve killed by signal {-info.code} (pid={child.pid})"
         return f"serve exited with code {info.code} (pid={child.pid})"
-
-    def _restart_async(self, dead_child) -> None:
-        model, port, args = self._model, self._port, list(self._args)
-        if model is None or port is None:
-            return
-
-        def _run():
-            try:
-                self.start(model, port, args, _auto=True)
-            except Exception as exc:  # noqa: BLE001
-                self._emit(f"auto-restart failed: {exc}")
-
-        threading.Thread(target=_run, name="ft-daemon-autorestart", daemon=True).start()
 
     # ---- oom ----
 

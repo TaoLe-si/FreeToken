@@ -1,0 +1,8 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(binding = 0) writeonly buffer c_blob { float c_blob_data[]; };
+void main() {
+    const uint gx = gl_GlobalInvocationID.x;
+    float v = float(gx) * 1.0001 + 0.5;
+    if (gl_LocalInvocationID.x == 0u) c_blob_data[gx / 256u] = v;
+}

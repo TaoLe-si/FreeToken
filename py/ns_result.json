@@ -1,0 +1,1 @@
+{"body": "{\"id\":\"chatcmpl-0\",\"object\":\"chat.completion\",\"created\":1787748863,\"model\":\"q\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"Here's a thinking process:\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}", "ok": true, "t": 4.0}

@@ -203,6 +203,11 @@ def _rename(raw_name: str) -> str | None:
     """HF key -> FreeToken state-dict key, or None to skip."""
     if raw_name.startswith(("model.visual.", "visual.")):  # mtp.* preserved
         return None  # mtp.* is preserved for MTP speculative decoding
+    # The MTP head (mtp.*) is read straight from the safetensors by
+    # load_mtp_head_from_safetensors; the dense pass must not yield it into the main
+    # model state dict (Unexpected keys otherwise).
+    if raw_name.startswith("mtp."):
+        return None
     # ModelOpt FP8 KV-cache static scales (full-attention layers only). FreeToken keeps the
     # KV cache in the engine's native precision (>= the checkpoint's quantized KV), so these
     # per-tensor q/k/v scales are unused -- drop them rather than fail as unexpected keys.
@@ -211,6 +216,11 @@ def _rename(raw_name: str) -> str | None:
     name = raw_name
     if name.startswith("model.language_model."):
         name = "model." + name[len("model.language_model.") :]
+    elif name.startswith("language_model.model."):
+        # Qwen3.6 / Qwen3-VL checkpoints wrap the inner model under both "language_model." and
+        # ".model." (e.g. language_model.model.embed_tokens.weight). Strip both so the inner
+        # "model." anchor matches the FreeToken wrapper.
+        name = "model." + name[len("language_model.model.") :]
     elif name.startswith("language_model."):
         name = "model." + name[len("language_model.") :]
     return name
@@ -270,7 +280,7 @@ def iter_weights(
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
         )
         return
-    if config.attn_quant == "fp8_pertensor":
+    if config.attn_quant in ("fp8_pertensor", "nvfp4"):
         # modelopt MIXED_PRECISION: dense attn/GDN projections kept per-tensor FP8 (fp8
         # weight + per-row scale, W8A16 kernel); NVFP4 dense (shared_expert/lm_head) kept
         # native FP4 (W4A16) when dense_quant=="nvfp4", else dequantized to bf16; routed
@@ -280,6 +290,7 @@ def iter_weights(
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
             dense_nvfp4=config.dense_quant == "nvfp4",
             lmhead_nvfp4=config.lm_head_quant == "nvfp4",
+            attn_nvfp4=config.attn_quant == "nvfp4",
         )
         return
     tp_info = get_tp_info()
@@ -353,6 +364,21 @@ def iter_weights(
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
                         yield fused
+                    continue
+
+                # Native FP8 lm_head: config parse flips lm_head_quant to fp8_pertensor by
+                # default (FREETOKEN_LM_HEAD_FP8_NATIVE=1), so a checkpoint that stores the
+                # head in bf16 (pure NVFP4 / our MXFP4->NVFP4 conversion) must be quantized
+                # here -- per-tensor e4m3 + the scalar expanded across rows, exactly what
+                # Fp8PerTensorLinear.load_state_dict expects (see fp8_pertensor_linear.py).
+                if (name == "lm_head.weight"
+                        and getattr(config, "lm_head_quant", "none") == "fp8_pertensor"
+                        and tensor.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)):
+                    wf = tensor.to(device).float()
+                    scale = wf.abs().amax().clamp(min=1e-12) / 448.0
+                    q = (wf / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+                    yield name, q
+                    yield "lm_head.weight_scale", scale.expand(q.shape[0]).contiguous()
                     continue
 
                 if _is_gemma_norm(name):
@@ -454,7 +480,8 @@ _NOT_DENSE_NVFP4 = object()
 
 
 def _dense_nvfp4_emit(
-    f, base: str, raw_base: str, *, shared_nvfp4: bool, lmhead_nvfp4: bool, shared_buf: dict
+    f, base: str, raw_base: str, *, shared_nvfp4: bool, lmhead_nvfp4: bool,
+    attn_nvfp4: bool = False, shared_buf: dict = None,
 ):
     """For a dense ``.weight`` whose checkpoint has a ``weight_scale_2`` (NVFP4), return the list
     of ``(key, tensor)`` to yield as native FP4 -- ``(.weight uint8, .weight_scale fp8 block,
@@ -468,10 +495,48 @@ def _dense_nvfp4_emit(
     Returns ``[]`` while a gate/up merge is still buffered, or ``_NOT_DENSE_NVFP4`` if the model
     does not keep this layer native (the caller dequantizes to bf16 exactly as before). Shared by
     the mixed-FP8 dense pass and the default (pure-NVFP4) dense pass."""
+    if shared_buf is None:
+        shared_buf = {}
     is_lmhead = base == "lm_head" or base.endswith(".lm_head")
     if lmhead_nvfp4 and is_lmhead:
         w, s, g = _nvfp4_parts(f, raw_base)
         return [(base + ".weight", w), (base + ".weight_scale", s), (base + ".weight_global", g)]
+    if attn_nvfp4:
+        # standalone W4A16 projections (self_attn.o_proj, GDN out_proj)
+        if base.endswith((".self_attn.o_proj", ".linear_attn.out_proj")):
+            w, s, g = _nvfp4_parts(f, raw_base)
+            return [(base + ".weight", w), (base + ".weight_scale", s), (base + ".weight_global", g)]
+        # self_attn q|k|v -> qkv_proj (output-dim concat, per-part scales)
+        if base.endswith((".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj")):
+            w, s, g = _nvfp4_parts(f, raw_base)
+            key = base.rsplit(".self_attn.", 1)[0] + ".self_attn.qkv_proj"
+            idx = (".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj").index(
+                base[base.rfind(".self_attn."):])
+            slots = shared_buf.setdefault(key, {})
+            slots[idx] = (w, s, g)
+            if len(slots) < 3:
+                return []
+            del shared_buf[key]
+            return [
+                (key + ".weight", torch.cat([slots[i][0] for i in range(3)], dim=0)),
+                (key + ".weight_scale", torch.cat([slots[i][1] for i in range(3)], dim=0)),
+                (key + ".weight_global", torch.cat([slots[i][2] for i in range(3)], dim=0)),
+            ]
+        # GDN in_proj_qkv | in_proj_z -> in_proj_qkvz (split [conv_dim, value_dim])
+        if base.endswith((".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z")):
+            w, s, g = _nvfp4_parts(f, raw_base)
+            key = base.rsplit(".linear_attn.", 1)[0] + ".linear_attn.in_proj_qkvz"
+            idx = 0 if base.endswith(".in_proj_qkv") else 1
+            slots = shared_buf.setdefault(key, {})
+            slots[idx] = (w, s, g)
+            if len(slots) < 2:
+                return []
+            del shared_buf[key]
+            return [
+                (key + ".weight", torch.cat([slots[0][0], slots[1][0]], dim=0)),
+                (key + ".weight_scale", torch.cat([slots[0][1], slots[1][1]], dim=0)),
+                (key + ".weight_global", torch.cat([slots[0][2], slots[1][2]], dim=0)),
+            ]
     if not shared_nvfp4:
         return _NOT_DENSE_NVFP4
     for gate_b, up_b, down_b, infix in _NVFP4_MLP_LAYOUTS:
@@ -499,7 +564,7 @@ def _dense_nvfp4_emit(
 
 def _iter_weights_attn_fp8(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
-    dense_nvfp4: bool = False, lmhead_nvfp4: bool = False,
+    dense_nvfp4: bool = False, lmhead_nvfp4: bool = False, attn_nvfp4: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Dense pass for the modelopt MIXED_PRECISION Qwen3.5 checkpoint.
 
@@ -568,7 +633,8 @@ def _iter_weights_attn_fp8(
                     if has_s2:  # NVFP4 dense: keep native (W4A16) where the model expects it
                         emit = _dense_nvfp4_emit(
                             f, base, raw_base, shared_nvfp4=dense_nvfp4,
-                            lmhead_nvfp4=lmhead_nvfp4, shared_buf=nvfp4_shared_buf,
+                            lmhead_nvfp4=lmhead_nvfp4, attn_nvfp4=attn_nvfp4,
+                            shared_buf=nvfp4_shared_buf,
                         )
                         if emit is not _NOT_DENSE_NVFP4:
                             yield from emit

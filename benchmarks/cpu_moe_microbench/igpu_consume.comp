@@ -1,0 +1,8 @@
+#version 450
+layout(binding = 0) readonly buffer in_buf { float inv[]; };
+layout(binding = 1) writeonly buffer out_buf { float outv[]; };
+layout(push_constant) uniform P { uint N; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < p.N) outv[i] = inv[i] * 1.0000001;
+}

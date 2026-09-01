@@ -14,6 +14,7 @@ import functools
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -570,10 +571,11 @@ _ALLOWED_ENGINE_FLAGS = {
     "--num-tokenizer", "--max-prefill-length", "--disable-pynccl", "--num-pages",
     "--page-size", "--tool-call-parser", "--reasoning-parser", "--served-model-name",
     "--model-source", "--nvfp4-backend", "--expert-load", "--moe-hybrid-max-fetch",
-    "--moe-cache-policy", "--enable-cache-report", "--sampling-defaults",
+    "--moe-cache-policy", "--enable-cache-report", "--sampling-defaults", "--mtp", "--mtp-k", "--mtp-igpu-fc", "--no-mtp-igpu-fc", "--mtp-igpu-verify-graph", "--no-mtp-igpu-verify-graph",
     "--moe-prefill-hit-d2d", "--decode-log-interval", "--num-tokens", "--host", "--port",
     "--dense-ffn-engine", "--igpu-service", "--igpu-no-fallback",
     "--kv-device", "--kv-quant", "--ct-fp8", "--num-tokens-override",
+    "--mtp", "--mtp-k", "--mtp-igpu-fc", "--mtp-igpu-verify-graph", "--disable-moe-prefill-overlap",
 }
 
 def _sanitize_engine_args(args):
@@ -1471,14 +1473,20 @@ def build_app(
     # ---- Same-origin /v1 reverse proxy -----------------------------------------
     # WebView2 blocks cross-origin calls to the engine port (no CORS there), so the
     # panel must reach chat/models through THIS origin. Streams SSE transparently.
-    import httpx as _httpx
+    import urllib.request as _urllib_req
     from fastapi.responses import Response as _Resp, StreamingResponse as _Stream
-    from starlette.background import BackgroundTask as _Bg
-
-    _engine_client = _httpx.Client(timeout=_httpx.Timeout(10.0, read=None))
 
     @app.api_route("/v1/{path:path}", methods=["GET", "POST"], include_in_schema=False)
     async def v1_proxy(path: str, request: Request):
+      """Forward a request to the engine's /v1/<path> loopback and return its response.
+
+      Uses urllib + a thread executor instead of httpx. httpx hangs forever on
+      the engine's /v1/chat/completions response because the engine streams a
+      chunked SSE-style body whose final empty chunk arrives only after the
+      response is read; with httpx's connection pool the read block never
+      completes. urllib's HTTPResponse handles chunked termination cleanly and
+      also works for plain JSON responses and SSE streams.
+      """
       try:
         st = manager.status()
         port = st.get("port") or default_serve_port
@@ -1486,28 +1494,72 @@ def build_app(
             return _Resp('{"error":{"message":"engine not running"}}',
                          status_code=503, media_type="application/json")
         body = await request.body()
-        req = _engine_client.build_request(
-            request.method,
-            "http://127.0.0.1:%d/v1/%s" % (port, path),
-            content=body if body else None,
-            headers={"Content-Type": request.headers.get("content-type",
-                     "application/json")},
-            params=dict(request.query_params),
-        )
+        # Forward the original request body verbatim, but only Content-Type
+        # (drop everything else - they belong to the inbound hop and uvicorn
+        # recomputes Host / Content-Length / Connection itself).
+        fwd_headers = {"Content-Type": request.headers.get("content-type",
+                                                            "application/json")}
+        # Preserve the caller's Accept header so SSE clients still get SSE.
+        accept_hdr = request.headers.get("accept")
+        if accept_hdr:
+            fwd_headers["Accept"] = accept_hdr
+        url = "http://127.0.0.1:%d/v1/%s" % (port, path)
+        if request.query_params:
+            url += "?" + request.query_params
+
+        def _do_request():
+            req = _urllib_req.Request(url, data=body if body else None,
+                                      headers=fwd_headers,
+                                      method=request.method)
+            # The engine's uvicorn may take a while to tokenize + generate;
+            # urllib's default is infinite on read, which is what we want for SSE.
+            return _urllib_req.urlopen(req, timeout=600)
+
         try:
-            up = await run(proxy_pool, lambda: _engine_client.send(req, stream=True))
+            up = await run(proxy_pool, _do_request)
         except Exception as exc:
             return _Resp('{"error":{"message":"engine unreachable: %s"}}' % exc,
                          status_code=502, media_type="application/json")
-        return _Stream(up.iter_raw(), status_code=up.status_code,
-                       media_type=upstream_ct(up),
-                       background=_Bg(up.close))
+
+        # Filter hop-by-hop headers
+        hop_by_hop = {"content-length", "transfer-encoding", "connection",
+                      "keep-alive", "proxy-authenticate", "proxy-authorization",
+                      "te", "trailers", "upgrade"}
+        out_headers = {k: v for k, v in up.headers.items()
+                       if k.lower() not in hop_by_hop}
+
+        # Detect streaming: if Content-Type is text/event-stream, pipe raw
+        # chunks as the response body.
+        ct = up.headers.get("content-type", "")
+        if "text/event-stream" in ct.lower():
+            def _gen():
+                try:
+                    while True:
+                        chunk = up.read(4096)
+                        if not chunk:
+                            break
+                        yield chunk
+                finally:
+                    try:
+                        up.close()
+                    except Exception:
+                        pass
+            return _Stream(_gen(), status_code=up.status, media_type=ct,
+                           headers=out_headers)
+        # Non-streaming: read everything and return as a single Response.
+        try:
+            content = up.read()
+        finally:
+            try:
+                up.close()
+            except Exception:
+                pass
+        return _Resp(content, status_code=up.status, media_type=ct,
+                     headers=out_headers)
       except Exception as exc:
         return _Resp('{"error":{"message":"proxy failure: %s"}}' % exc,
                      status_code=502, media_type="application/json")
 
-    def upstream_ct(resp):
-        return resp.headers.get("content-type", "application/json")
 
     @app.get("/panel.css", include_in_schema=False)
     async def control_panel_css():
@@ -1899,6 +1951,142 @@ def build_app(
                 removed.append(child.name)
                 freed += size
         return {"removed": removed, "freed": freed}
+    @staticmethod
+    def _json_load(path: str) -> dict:
+        import json as _j
+        with open(path, encoding="utf-8") as _f:
+            return _j.load(_f)
+
+    # ---- in-app NVFP4 conversion (MXFP4/raw -> NVFP4) --------------------------
+    # Runs checkpoint/quantize.quantize_to_nvfp4 in a daemon thread so the job
+    # outlives any single panel request; progress lands in the job dict directly.
+    _CONVERT_JOBS: dict = {}
+
+    @app.post("/models/convert-nvfp4", dependencies=auth)
+    async def models_convert_nvfp4(body: dict = None):
+        """Start an in-app MXFP4/raw -> NVFP4 conversion.
+        body: {path, out?}  -- out defaults to a <path>-NVFP4 sibling dir.
+        Returns the job id; poll /models/convert-nvfp4/status for progress."""
+        import uuid as _uuid, threading as _td
+        src = (body or {}).get("path") or ""
+        if not src or not os.path.isdir(src):
+            raise HTTPException(status_code=400, detail=f"not a model dir: {src!r}")
+        if any(j["src"] == src and j["status"] in ("queued", "running")
+               for j in _CONVERT_JOBS.values()):
+            cur = next(j for j in _CONVERT_JOBS.values()
+                       if j["src"] == src and j["status"] in ("queued", "running"))
+            return {"error": "conversion already active for this model", "job": cur}
+        out = (body or {}).get("out")
+        if not out:
+            out = src.rstrip("/\\") + "-NVFP4"
+        if os.path.isdir(out) and os.listdir(out):
+            raise HTTPException(status_code=409, detail=f"output dir not empty: {out!r}")
+        job_id = f"cv-{_uuid.uuid4().hex[:8]}"
+        job = {"id": job_id, "src": src, "out": out, "status": "queued",
+               "phase": "", "done": 0, "total": 0, "message": "排队中",
+               "error": None, "startedAt": time.time()}
+        _CONVERT_JOBS[job_id] = job
+
+        def _progress(phase: str, done: int, total: int) -> None:
+            job["phase"] = phase
+            job["done"] = int(done)
+            job["total"] = int(total)
+
+        def _write_mtp_sidecar(inter_dir: str, ftw_dir: str) -> int:
+            """Gather mtp.* tensors from the stage-1 safetensors into <ftw>/mtp.safetensors.
+            The FTW dense pass skips them; the MTP loader reads the sidecar when the
+            safetensors index is absent (models/qwen3_5_moe/mtp.py)."""
+            import json as _json
+            from safetensors import safe_open
+            from safetensors.torch import save_file
+            idx = _json.load(open(os.path.join(inter_dir, "model.safetensors.index.json"), encoding="utf-8"))
+            wm = idx["weight_map"]
+            mtp_keys = [k for k in wm if k.startswith("mtp.")]
+            if not mtp_keys:
+                return 0
+            state = {}
+            for fname in sorted(set(wm[k] for k in mtp_keys)):
+                with safe_open(os.path.join(inter_dir, fname), framework="pt") as f:
+                    for k in f.keys():
+                        if k.startswith("mtp."):
+                            state[k] = f.get_tensor(k)
+            save_file(state, os.path.join(ftw_dir, "mtp.safetensors"))
+            return len(state)
+
+        def _run() -> None:
+            inter = out + "-tmp"  # stage-1 safetensors; removed once the FTW is written
+            job["status"] = "running"
+            job["message"] = "阶段 1/2: 量化 (MXFP4 -> NVFP4)"
+            try:
+                import shutil as _sh
+                import torch
+                from freetoken.checkpoint.quantize import quantize_to_nvfp4
+                torch.cuda.init()
+                if os.path.isdir(inter):
+                    _sh.rmtree(inter, ignore_errors=True)
+                r = quantize_to_nvfp4(src, inter, device="cuda", progress=_progress)
+                # Release stage-1 buffers before the bank-heavy FTW pass: the PyTorch CPU
+                # allocator otherwise keeps ~20 GB of freed decode tensors committed and
+                # the expert-host-bank allocation hits WinError 1455 (commit limit).
+                import gc as _gc
+                _gc.collect()
+                torch.cuda.empty_cache()
+                # stage 2: FTW (engine-native fast-load format, ~20 s loads) in a
+                # SUBPROCESS -- a fresh commit space for the ~20 GB expert host banks.
+                job["message"] = "阶段 2/2: 打包 FTW (引擎原生格式)"
+                _progress("ftw", 0, 0)
+                import subprocess as _sp, sys as _sys
+                import freetoken as _ft_pkg
+                _py_root = os.path.dirname(os.path.dirname(os.path.abspath(_ft_pkg.__file__)))
+                env = {**os.environ, "PYTHONPATH": _py_root,
+                       "FREETOKEN_CONVERT_PROGRESS": "1"}
+                cmd = [_sys.executable, "-m", "freetoken.checkpoint",
+                       "--model", inter, "--out", out, "--moe-backend", "offload"]
+                proc = _sp.Popen(cmd, env=env, stdout=_sp.PIPE,
+                                 stderr=_sp.STDOUT, text=True,
+                                 encoding="utf-8", errors="replace")
+                tail: list = []
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line.startswith("FTCONVERT"):
+                        parts = line.split()
+                        if len(parts) >= 4 and parts[1] == "experts":
+                            _progress("ftw-experts", parts[2], parts[3])
+                        elif parts[1:2] == ["dense"]:
+                            _progress("ftw-dense", 0, 0)
+                    elif line:
+                        tail.append(line)
+                        tail = tail[-20:]
+                rc = proc.wait()
+                if rc != 0:
+                    raise RuntimeError("FTW 打包失败: " + chr(10).join(tail[-10:])[:900])
+                n_mtp = _write_mtp_sidecar(inter, out)
+                _sh.rmtree(inter, ignore_errors=True)  # free the ~20 GB intermediate
+                import json as _js
+                with open(os.path.join(out, "freetoken_weight.json"), encoding="utf-8") as _f:
+                    _idx = _js.load(_f)
+                job.update(status="done", message="完成 (FTW, 加载 ~20 s)",
+                           stats=r["stats"], shards=len(_idx.get("shards", [])),
+                           mtpKeys=n_mtp, finishedAt=time.time())
+            except SystemExit as e:
+                job.update(status="error", error=str(e), message="失败",
+                           finishedAt=time.time())
+            except Exception as e:  # noqa: BLE001
+                import traceback as _tb
+                job.update(status="error", error=str(e),
+                           message="失败: " + str(e)[:200],
+                           traceback=_tb.format_exc()[-2000:],
+                           finishedAt=time.time())
+
+        _td.Thread(target=_run, daemon=True, name=f"ft-convert-{job_id}").start()
+        return {"jobId": job_id, "out": out, "status": "queued"}
+
+    @app.post("/models/convert-nvfp4/status", dependencies=auth)
+    async def models_convert_nvfp4_status():
+        """Progress of in-app conversions: {active: [{id, src, out, status, phase,
+        done, total, message, error}...]} (finished jobs stay until the dict resets)."""
+        return {"active": list(_CONVERT_JOBS.values())}
+
     @app.post("/models/local-quants", dependencies=auth)
     async def models_local_quants(body: dict = None):
         """Scan a local model directory for quantization files.

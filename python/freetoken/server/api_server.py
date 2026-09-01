@@ -52,6 +52,7 @@ from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
 from .openai_api import register_openai_routes
 from . import request_ring
+from .generation import GenerationError
 from .access_log_filter import install_polling_access_log_filter
 from .request_logger import init as init_request_logging, log_request
 from .responses_api import register_responses_routes
@@ -327,6 +328,38 @@ class FrontendManager:
             # Loop already closed (shutdown racing the crash): nothing left to wake.
             pass
 
+    def fail_live_generations(self, message: str) -> None:
+        """Deliver a synthetic terminal reply to every pending generation waiter. Called from
+        the supervisor thread next to fail_pending_rebuilds when a worker death latches a
+        fatal error: no further UserReply will ever arrive, so each uid parked in
+        wait_for_ack's ``await event.wait()`` would otherwise strand. Mirrors the rebuild
+        pattern: resolve ON the event loop via call_soon_threadsafe — mutating ack_map /
+        setting asyncio.Events is not thread-safe, and wait_for_ack only ever touches them
+        from the loop thread (the listen() task), so we marshal back from off-thread."""
+        loop = self._loop
+        if loop is None:
+            return  # listener never started -> no waiters could be pending
+
+        def _resolve_all() -> None:
+            for uid in list(self.ack_map):
+                event = self.event_map.get(uid)
+                self.ack_map[uid].append(
+                    UserReply(
+                        uid=uid,
+                        incremental_output="",
+                        finished=True,
+                        error=f"backend worker died: {message}",
+                    )
+                )
+                if event is not None:
+                    event.set()
+
+        try:
+            loop.call_soon_threadsafe(_resolve_all)
+        except RuntimeError:
+            # Loop already closed (shutdown racing the crash): nothing left to wake.
+            pass
+
     def _create_listener_once(self):
         if not self.initialized:
             self._loop = asyncio.get_running_loop()
@@ -339,13 +372,31 @@ class FrontendManager:
 
     async def wait_for_ack(self, uid: int):
         event = self.event_map[uid]
+        # Bounded request lifetime: if no ack arrives within config.request_timeout_s, abort
+        # the request (frees its engine slot + maps) and raise the same GenerationError a
+        # failed engine reply produces, so every adapter's existing error path (SSE error
+        # chunk + [DONE], JSON 500, ...) handles it unchanged.
+        request_timeout_s = float(getattr(self.config, "request_timeout_s", 600.0))
+        deadline = time.monotonic() + request_timeout_s
         # finally, not a trailing statement: every consumer breaks out of its `async for` at
         # the terminal ack, leaving this generator suspended at the yield. Cleanup written
         # after the loop would then only run on paths nobody takes, leaking both maps once
         # per completed request. GeneratorExit runs the finally.
         try:
             while True:
-                await event.wait()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    await self.abort_user(uid)
+                    raise GenerationError(
+                        f"request timed out after {request_timeout_s:.0f}s without a terminal reply"
+                    ) from None
+                try:
+                    await asyncio.wait_for(event.wait(), remaining)
+                except asyncio.TimeoutError:
+                    await self.abort_user(uid)
+                    raise GenerationError(
+                        f"request timed out after {request_timeout_s:.0f}s without a terminal reply"
+                    ) from None
                 event.clear()
 
                 pending = self.ack_map[uid]
@@ -1012,6 +1063,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
         _GLOBAL_STATE.fail_pending_rebuilds(message)
+        # Same for generation: no further UserReply will arrive from a dead backend, so wake
+        # every pending wait_for_ack waiter with a synthetic terminal (error) reply.
+        _GLOBAL_STATE.fail_live_generations(message)
         # Then take the whole serve down (see _exit_after_backend_death). Shell mode is excluded:
         # a person is sitting at that TUI, the API is theirs alone, and its stop path is ^C.
         if not run_shell:

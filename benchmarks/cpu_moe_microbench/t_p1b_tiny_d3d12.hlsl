@@ -1,0 +1,5 @@
+RWStructuredBuffer<float> outv : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    outv[id.x] = 42.0f;
+}

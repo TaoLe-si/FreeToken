@@ -353,7 +353,7 @@ class Fp8LMHead(Fp8PerTensorLinear):
         from freetoken.core import get_global_ctx
 
         batch = get_global_ctx().batch
-        if batch.is_prefill:
+        if batch.is_prefill and not getattr(batch, "no_lm_head_gather", False):
             indices = batch.attn_metadata.get_last_indices(batch.size)
             x = x[indices].contiguous()
         return super().forward(x)

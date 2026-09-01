@@ -79,11 +79,54 @@ class Qwen3_5Model(BaseOP):
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, return_raw: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # G.3: if a graph handle is bound on the batch, replay the cached
+        # CUDAGraph instead of running the 24-layer loop. The scheduler binds
+        # the handle via ModelVerifyGraphBackend.prepare_for_replay. This
+        # collapses ~265 kernel launches into a single dispatch (~10 us vs
+        # ~2 ms minimum even on the 5090) for the MTP-verify path.
+        from freetoken.core import get_global_ctx
+        _ctx_for_graph = get_global_ctx()
+        if _ctx_for_graph is not None and _ctx_for_graph.batch is not None:
+            _g_handle = getattr(_ctx_for_graph.batch, "graph_handle", None)
+            if _g_handle is not None and hasattr(_g_handle, "replay"):
+                # Copy the live input_ids into the stable capture buffer before
+                # replay (the graph was captured against the stable buffer).
+                _buf = getattr(_ctx_for_graph.batch, "mtp_verify_input_buf", None)
+                if _buf is not None and input_ids is not _buf:
+                    _buf[: input_ids.shape[0]].copy_(input_ids)
+                _g_handle.replay()
+                _cached = getattr(_ctx_for_graph.batch, "mtp_verify_output", None)
+                if _cached is not None:
+                    _out, _raw = _cached
+                    if return_raw:
+                        return _out, _raw
+                    return _out
+                # Main-decode graph path: the engine may set batch.graph_handle
+                # to the graph_runner graph + populate prev_hidden_buf / all_hidden_buf.
+                _ah_buf = getattr(_ctx_for_graph.batch, "mtp_all_hidden_buf", None)
+                if _ah_buf is not None and return_raw:
+                    # Marker so forward_with_hidden knows the replay path took over and
+                    # the lm_head call there should be skipped (logits already in buffer.logits).
+                    _ctx_for_graph.batch.mtp_replayed = True
+                    # Return raw pre-norm hidden for prev_hidden derivation.
+                    return _ah_buf[: input_ids.shape[0]], _ah_buf[: input_ids.shape[0]]
+                # If cache is missing, fall through to eager (shouldn't happen).
+
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
+        if return_raw:
+            # Raw (pre-final-norm) hidden: the MTP head's expected input -- it has
+            # its own pre_fc_norm_hidden, so feeding the post-norm hidden would
+            # double-norm. Computed BEFORE the fused add-norm (which mutates the
+            # residual buffer in place).
+            raw = (x + residual) if residual is not None else x
+            x, _ = self.norm.forward_add_residual(x, residual)
+            return x, raw
         x, _ = self.norm.forward_add_residual(x, residual)
         return x
 
@@ -121,18 +164,72 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)
 
-    def forward_with_hidden(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward_with_hidden(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward that also returns the post-norm hidden state (before lm_head).
 
-        The hidden state at the last token position is the prev_hidden consumed by
-        the MTP head for the next speculative decode step.
+        The hidden state at each request's last token position is the prev_hidden
+        consumed by the MTP head for that request's next speculative decode step.
+        ``output`` here is paged-attention's flat [total_T, hidden] tensor (not a
+        [bs, T, H] view), so we must index with ``attn_metadata.get_last_indices``
+        to recover one row per request — not the slice ``output[:, -1:, :]``
+        that would either error on the 2D shape or silently read the last H cols.
 
-        Returns (logits, prev_hidden) where prev_hidden has the same shape as a single
-        embedding row [1, hidden_size].
+        Returns (logits, prev_hidden, all_hidden): prev_hidden is [bs, hidden_size]
+        (0 rows when batch.size == 0); all_hidden is the full [total_T, H] hidden
+        (MTP context seeding consumes it for prefill/verify batches).
         """
-        output = self.model.forward(get_global_ctx().batch.input_ids)
-        prev_hidden = output[:, -1:, :].detach()
+        batch = get_global_ctx().batch
+        output, raw = self.model.forward(batch.input_ids, return_raw=True)
+        if batch.size == 0:
+            zeros = output.new_zeros((0, output.shape[-1]))
+            return self.lm_head.forward(output), zeros, raw.detach()
+        indices = batch.attn_metadata.get_last_indices(batch.size)
+        # MTP consumes the PRE-final-norm raw hidden -- the head has its own
+        # pre_fc_norm_hidden and was trained against this distribution.
+        prev_hidden = raw[indices].detach()  # [bs, H]
+        # If the inner forward already ran the captured graph (set the flag during
+        # replay), the lm_head was captured too -- pull logits from buffer.logits
+        # instead of re-running lm_head (which would re-trigger a fresh graph).
+        if getattr(batch, "mtp_replayed", False):
+            # Reset unconditionally: a stale True flag would make the NEXT eager
+            # forward early-return the (wrong) buffered logits again.
+            batch.mtp_replayed = False
+            _logits_buf = getattr(batch, "mtp_logits_buf", None)
+            if _logits_buf is not None:
+                logits = _logits_buf[: batch.size].detach()
+                return logits, prev_hidden, raw.detach()
         logits = self.lm_head.forward(output)
-        return logits, prev_hidden
+        # Diagnostic (FT_MTP_DIAG=1): compare what the MTP head actually sees vs the
+        # last-layer outputs the model produces. We log BOTH the pre-final-norm raw
+        # (which MTP currently consumes via prev_hidden) AND the post-final-norm output
+        # (the model's official "previous_hidden_state" per Qwen3-Next modeling code).
+        import os as _os
+        if _os.environ.get("FT_MTP_DIAG"):
+            with torch.no_grad():
+                pv = prev_hidden.float()
+                op = output[indices].detach().float()
+                rw = raw[indices].detach().float()
+                print(
+                    f"[MTP-diag] model_hidden: prev_hidden(raw)[n={pv.shape[0]}] "
+                    f"mean={pv.mean().item():.3f} std={pv.std().item():.3f} "
+                    f"min={pv.min().item():.3f} max={pv.max().item():.3f} "
+                    f"norm={pv.norm(dim=-1).mean().item():.3f}",
+                    flush=True,
+                )
+                print(
+                    f"[MTP-diag] model_hidden: post_norm_output[n={op.shape[0]}] "
+                    f"mean={op.mean().item():.3f} std={op.std().item():.3f} "
+                    f"min={op.min().item():.3f} max={op.max().item():.3f} "
+                    f"norm={op.norm(dim=-1).mean().item():.3f}",
+                    flush=True,
+                )
+                print(
+                    f"[MTP-diag] model_hidden: raw_pre_norm[n={rw.shape[0]}] "
+                    f"mean={rw.mean().item():.3f} std={rw.std().item():.3f} "
+                    f"min={rw.min().item():.3f} max={rw.max().item():.3f} "
+                    f"norm={rw.norm(dim=-1).mean().item():.3f}",
+                    flush=True,
+                )
+        return logits, prev_hidden, raw.detach()
 
 __all__ = ["Qwen3_5MoEForCausalLM"]

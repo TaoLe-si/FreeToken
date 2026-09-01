@@ -1,0 +1,23 @@
+#version 450
+// 激活量化（W4A8）：每 16 元素一块 → int8 + per-block scale
+layout(binding = 0) readonly buffer in_buf { float inv[]; };
+layout(binding = 1) buffer out_i8 { uint out8[]; };   // 4 int8/uint
+layout(binding = 2) buffer out_asb { float asb[]; };
+layout(push_constant) uniform P { uint N; } p;  // N = 元素数（16 的倍数）
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint nb = p.N / 16u;
+    if (g >= nb) return;
+    float amax = 0.0;
+    for (int j = 0; j < 16; ++j) amax = max(amax, abs(inv[g*16u + uint(j)]));
+    float sc = amax / 127.0;
+    if (sc == 0.0) sc = 1.0;
+    asb[g] = sc;
+    uint pack[4];
+    for (int j = 0; j < 16; ++j) {
+        int q = int(round(inv[g*16u + uint(j)] / sc));
+        if (q > 127) q = 127; else if (q < -127) q = -127;  // clamp 防 -128
+        pack[j / 4] |= uint(q & 0xFF) << ((uint(j) % 4u) * 8u);
+    }
+    out8[g*4u] = pack[0]; out8[g*4u+1u] = pack[1]; out8[g*4u+2u] = pack[2]; out8[g*4u+3u] = pack[3];
+}

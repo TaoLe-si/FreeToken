@@ -1,0 +1,9 @@
+=== 5570-5680 ===
+A_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home is None:
+        # Guess #2
+        nvcc_path = shuti
+
+=== 5860-5980 ===
+         cuda_root = Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA")
+                cuda_homes = list(cuda_r

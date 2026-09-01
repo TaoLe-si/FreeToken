@@ -80,6 +80,29 @@ class EngineConfig:
     # ~1/2 of bf16); "q4_0" is accepted but currently falls back to bf16 with a warning
     # at startup (q4_0 / subnormal handling is not yet implemented in this build).
     kv_quant: str = "bf16"
+    # MTP (Multi-Token Prediction) speculative decoding. ``mtp=True`` enables the head and
+    # the per-step draft hook in the scheduler; the head only fires on Qwen3.5/3.6 MoE
+    # checkpoints (the only ones that ship an ``mtp.*`` block today). ``mtp_k`` is the
+    # number of speculative drafts per step (the head runs ``mtp_k`` autoregressive steps
+    # per accepted-batch round trip). ``mtp_igpu_fc`` routes the head's MXFP4 fc GEMV
+    # through the iGPU D3D12 service (slower than dGPU F.linear due to IPC + GPU fence
+    # sync; legacy path).
+    mtp: bool = False
+    # Default K=3: with --mtp-igpu-verify-graph enabled (P0), K=3 gives 25.9 t/s vs
+    # off-MTP 20 t/s (+30%); K=2 gives 21.2 t/s (~baseline), K=4 gives 23.2 t/s.
+    mtp_k: int = 3
+    # P2.1 (2026-09-02): default dGPU bf16 F.linear FC executor. The iGPU sticky bridge
+    # is ~1056 us/call (D3D12 stdin/stdout + fence sync); dGPU bf16 F.linear is ~75 us/call
+    # (14x faster) and keeps the result on the dGPU (no CPU/GPU sync hop). Set True to
+    # force the legacy iGPU sticky path.
+    mtp_igpu_fc: bool = False
+    # G.3: enable CUDA-graph capture of the 24-layer Qwen3_5Model.forward on
+    # MTP verify batches. Collapses ~265 kernel launches into a single
+    # dispatch for ~50-200x launch overhead reduction. Requires mtp=True and
+    # mtp_igpu_fc=True (the GPU side of the graph capture). Disabled by default
+    # -- the capture takes ~1-2s on first verify batch and adds ~50-100 MB of
+    # device-side cached graph memory per cached bs.
+    mtp_igpu_verify_graph: bool = False
 
     # compressed-tensors FP8 policy: "native" keeps float8 weights on the W8A16 kernel;
     # "bf16" dequantizes every FP8 dense weight at load (larger footprint, reference path).
@@ -112,14 +135,9 @@ class EngineConfig:
     num_token_override: int | None = None
 
     def __post_init__(self) -> None:
-        # q4_0 is reserved: warn and fall back to bf16. Done at the config layer so the
-        # rest of the engine never has to know about it.
-        if self.kv_quant == "q4_0":
-            from freetoken.utils import init_logger
-            init_logger(__name__).warning(
-                "kv-quant=q4_0 not implemented in this build, falling back to bf16"
-            )
-            object.__setattr__(self, "kv_quant", "bf16")
+        # q4_0 is implemented in MHAKVCache (llama.cpp Q4_0 blocks + shared bf16
+        # staging per layer); no fallback needed.
+        pass
 
     @cached_property
     def hf_config(self):

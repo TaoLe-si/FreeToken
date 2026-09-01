@@ -970,8 +970,15 @@ class Nvfp4LMHead(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from freetoken.core import get_global_ctx
 
-        batch = get_global_ctx().batch
-        if batch.is_prefill:
+
+        # MTP head (and other callers outside the engine's forward_batch context)
+        # may invoke lm_head without an active batch. Skip the prefill-only last-token
+        # gather in that case -- it's a no-op for single-token inputs anyway.
+        try:
+            batch = get_global_ctx().batch
+        except AssertionError:
+            batch = None
+        if batch is not None and batch.is_prefill and not getattr(batch, "no_lm_head_gather", False):
             indices = batch.attn_metadata.get_last_indices(batch.size)
             x = x[indices].contiguous()
         if self._transposed:

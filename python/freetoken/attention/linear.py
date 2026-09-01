@@ -33,6 +33,29 @@ class FLAMetadata:
     has_initial_state: torch.Tensor | None = None
     fresh_state_indices: torch.Tensor | None = None
 
+    # --- MTP-verify partial-rollback fields (analog to track_* below); all default -1 / None ---
+    # Per-verify-step GDN state trace (K+1 slots: snap[0]=pre-verify, snap[1..K]=post each
+    # verify step, snap[K]=post-verify). Populated by scheduler._build_mtp_verify_batch on
+    # MTP verify rounds; kernel writes per-step recurrent + conv snapshots when
+    # mtp_verify_step_idx >= 0. Mirrors track_dst/track_h_row/track_conv_src on the next
+    # fields -- the GDN op (_write_track_snapshot for track, _write_mtp_step_snapshot for MTP)
+    # reads these in the same way. -1 means "not an MTP verify round"; the kernel then takes
+    # its existing single-h-output path and leaves the snap slots untouched.
+    mtp_verify_step_idx: int = -1                              # current verify step (0..K)
+    mtp_verify_snap_slots: torch.Tensor | None = None          # [K+1] int64 dst pool slot per step
+
+    # --- MTP-verify per-step decode persistent buffers (G.2; CUDA-graph-capture-friendly) ---
+    # The C.4 per-step decode path needs three stable tensors + two stable host ints; without
+    # these it would either allocate new tensors every forward (graph capture fails) or sync
+    # via ``.item()`` (capture fails too). Pre-built in :meth:`Scheduler._prepare_batch` for
+    # mtp_verify rounds and reused across graph replays; stable addresses are required for
+    # graph capture / replay. ``mtp_verify_cu_seqlens_varlen = [0, K+1]`` (1 req, K+1 tokens),
+    # ``mtp_verify_has_initial_state = [True]`` (live slot always has the prior decode state).
+    mtp_verify_cu_seqlens_varlen: torch.Tensor | None = None    # [2] int32, persistent
+    mtp_verify_has_initial_state: torch.Tensor | None = None    # [1] bool, persistent
+    mtp_verify_snap_host_slots: list[int] | None = None          # K+1 host ints, stable per-req
+    mtp_verify_live_slot: int = -1                               # host int, live slot for this req
+
     # --- hybrid-radix track-checkpoint (extra_buffer) fields; all None when not caching ---
     # For each request crossing a chunk-aligned (×CHUNK) boundary this forward, snapshot its
     # recurrent + conv state into a donatable pool slot, written on the forward stream by the

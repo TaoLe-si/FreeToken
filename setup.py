@@ -28,6 +28,10 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
     library_dirs = [str(cuda_home / "lib64")]
     if (cuda_home / "lib").exists():
         library_dirs.append(str(cuda_home / "lib"))
+    # CUDA 13+ uses lib/x64 (no longer lib64). Add as fallback so the linker finds cudart.lib
+    # when v13 is the active toolchain (torch 2.11.0+cu130 ships v13 here).
+    if (cuda_home / "lib" / "x64").exists():
+        library_dirs.append(str(cuda_home / "lib" / "x64"))
     return [str(cuda_home / "include")], library_dirs
 
 
@@ -58,6 +62,24 @@ setup(
                 "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
             ],
             include_dirs=cuda_include_dirs,
+            library_dirs=cuda_library_dirs,
+            libraries=["cudart"],
+            extra_compile_args=["-O3", "-std=c++17", "-pthread"],
+        ),
+        # C++ glue layer for MTP/verify critical path (G + B + glue lines, 2026-08-29).
+        # P0-skeleton: IgpuService class is declared + stubbed on non-Windows; pybind11
+        # module loads everywhere so consumers can "import _freetoken_igpu" and get a
+        # graceful "unavailable" on Linux while seeing the real bridge on Windows.
+        # GdnDispatcher + MtpHead land in follow-up PRs.
+        CppExtension(
+            name="freetoken.kernel._freetoken_igpu",
+            sources=[
+                "python/freetoken/kernel/csrc/glue/igpu_service.cpp",
+                "python/freetoken/kernel/csrc/glue/pybind_module.cpp",
+            ],
+            include_dirs=cuda_include_dirs + [
+                str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "glue"),
+            ],
             library_dirs=cuda_library_dirs,
             libraries=["cudart"],
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],
