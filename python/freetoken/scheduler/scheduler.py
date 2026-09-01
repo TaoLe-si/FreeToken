@@ -1167,13 +1167,6 @@ class Scheduler(SchedulerIOMixin):
         self._mtp_release_gdn_snap(req)
 
         self._publish_verify_reply(req, reply, batch)
-        # Cleanup MTP scratch on the request (always, even when we bail early on a miss).
-        req.mtp_verify = False
-        req.mtp_drafts = None
-        req.mtp_base = None
-        self._mtp_release_gdn_snap(req)
-
-        self._publish_verify_reply(req, reply, batch)
 
     def _publish_verify_reply(
         self, req: Req, reply: List[DetokenizeMsg], batch: Batch | None = None
