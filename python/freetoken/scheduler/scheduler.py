@@ -452,6 +452,23 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                if os.environ.get("FT_MTP_DEBUG"):
+                    _pool = getattr(self.engine, "linear_state_pool", None)
+                    if _pool is not None:
+                        _slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+                        torch.cuda.synchronize()  # state-hash race fix
+                        _rec = _pool.recurrent_states[:, _slot].float()
+                        _cv = _pool.conv_states[:, _slot].float()
+                        logger.info_rank0("[MTP-dbg] state-hash: slot=%s cached=%s rec=%.6f/%.3f cv=%.6f/%.3f",
+                                          _slot, req.cached_len,
+                                          float(_rec.sum()), float(_rec.abs().max()),
+                                          float(_cv.sum()), float(_cv.abs().max()))
+                    if os.environ.get("FT_MTP_STATE_LAYERS") and req.cached_len == 23:
+                        _per = " ".join("L%d=%.4f/%.4f" % (li,
+                            float(_pool.recurrent_states[li, _slot].float().sum()),
+                            float(_pool.conv_states[li, _slot].float().sum()))
+                            for li in range(_pool.recurrent_states.shape[0]))
+                        logger.info_rank0("[MTP-dbg] per-layer: %s", _per)
                 logger.info_rank0(
                     "[dbg-reply] phase=%s tok=%d eos=%s can_decode=%s out_len=%d",
                     "prefill" if batch.is_prefill else "decode",
@@ -1160,12 +1177,20 @@ class Scheduler(SchedulerIOMixin):
                 self.finished_reqs.add(req)
 
         # Cleanup MTP scratch on the request (always, even when we bail early on a miss).
+        if os.environ.get("FT_MTP_DEBUG"):
+            _ids = req.input_ids
+            logger.info_rank0("[MTP-dbg] ids-tail: cached=%s ids=%s", req.cached_len,
+                              _ids[max(0, req.cached_len - 6):req.cached_len].tolist())
         req.mtp_verify = False
         req.mtp_drafts = None
         req.mtp_base = None
         req.mtp_pred0 = None
         self._mtp_release_gdn_snap(req)
 
+        if os.environ.get("FT_MTP_DEBUG"):
+            logger.info_rank0("[MTP-dbg] publish: m=%s n=%s pred0=%s drafts=%s corr=%s ship=%s",
+                              m, n, pred0, drafts[:4], correction,
+                              [mm.next_token for mm in reply])
         self._publish_verify_reply(req, reply, batch)
 
     def _publish_verify_reply(
@@ -1231,6 +1256,8 @@ class Scheduler(SchedulerIOMixin):
         # the prefill's prompt hiddens so each draft step attends over the full
         # context (the trained Qwen MTP head expects this -- window-only drafts
         # are out-of-distribution).
+        if os.environ.get("FT_MTP_NO_VERIFY"):
+            return
         stash = getattr(req, "_mtp_seed_hiddens", None)
         if stash is not None:
             start = getattr(req, "_mtp_seed_start", 0)

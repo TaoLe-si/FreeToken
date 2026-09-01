@@ -1324,6 +1324,11 @@ class Engine:
                 if (
                     not is_verify
                     and not os.environ.get("FT_DISABLE_DECODE_REPLAY")  # replay default-on; opt-out for debug
+                    # 2026-09-01: decode replay corrupts GDN state under MTP (outputs
+                    # loop after ~3 tokens; bit-exact eager matches pure decode).
+                    # Replay stays off for MTP until the capture-time state
+                    # interference is root-caused. See DELIVERY_2026-0901.md.
+                    and not getattr(self.config, "mtp", False)
                     and self.graph_runner.can_use_cuda_graph(batch)
                     and getattr(self.graph_runner, "_captures_hidden", False)
                 ):
