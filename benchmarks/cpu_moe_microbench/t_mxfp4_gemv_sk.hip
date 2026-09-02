@@ -22,16 +22,11 @@
 #define BLOCK 256
 
 __device__ __forceinline__ float fp4_to_float(unsigned n) {
-    // E2M1 lookup: 0-7 are positive (0,1,2,3,4,6,8,12), 8-15 are negative (same magnitudes)
-    // matches HLSL kernel's ternary chain
-    if (n < 8u) {
-        // 0,1,2,3,4,6,8,12
-        const float pos[8] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f};
-        return pos[n];
-    } else {
-        const float neg[8] = {0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f};
-        return neg[n - 8u];
-    }
+    // Qwen3.6 MXFP4 export is uint4-AFFINE (python/freetoken/checkpoint/quantize.py):
+    // value = nibble(0..15) * scale + bias per 32-block. NOT e2m1-coded. The old
+    // e2m1 table here decoded cos=-0.33 anti-correlated weights, poisoning the FC
+    // output and collapsing MTP acceptance to 0 (mtp.py _UAFF16 comment, 2026-09-02).
+    return float(n);
 }
 
 extern "C" __global__ __launch_bounds__(BLOCK) void mxfp4_gemv_fc(
@@ -57,6 +52,7 @@ extern "C" __global__ __launch_bounds__(BLOCK) void mxfp4_gemv_fc(
         float bb = bias_pb[sbase];
 
         float wsum = 0.0f;
+        float asum = 0.0f;   // sum of activations over this 32-block (for the affine bias)
         unsigned ai_base = b * 32u;
 
         // Process 4 uints = 32 nibbles
@@ -86,8 +82,10 @@ extern "C" __global__ __launch_bounds__(BLOCK) void mxfp4_gemv_fc(
             wsum += fp4_to_float(n5) * a5;
             wsum += fp4_to_float(n6) * a6;
             wsum += fp4_to_float(n7) * a7;
+            asum += a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
         }
-        acc += (wsum + bb) * bs2;
+        // exact affine: w = n*s + b  =>  dot_block = s*sum(n*a) + b*sum(a)
+        acc += wsum * bs2 + bb * asum;
     }
 
     __shared__ float sh[BLOCK];

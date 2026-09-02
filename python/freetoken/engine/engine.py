@@ -1385,7 +1385,30 @@ class Engine:
                     # Pass the inner Qwen3_5Model so the graph captures only the
                     # 24-layer stack + final norm (no LM head, no sampler).
                     self.verify_graph_backend = ModelVerifyGraphBackend(self.model.model)
-                self.verify_graph_backend.prepare_for_replay(batch)
+                try:
+                    self.verify_graph_backend.prepare_for_replay(batch)
+                except Exception as _vg_err:
+                    # WDDM: a stray async error landing inside the capture window
+                    # poisons capture_end (cudaErrorStreamCaptureInvalidated) even
+                    # though the captured work itself is fine -- observed as a 100%
+                    # reproducible scheduler kill on some boots (2026-09-02) while
+                    # the identical config captured cleanly on others. Degrade ONCE
+                    # to the eager verify path (identical math, slower launch path)
+                    # instead of killing the scheduler mid-request. Note: a failed
+                    # capture_end can leave the context wedged ("a previous error
+                    # during capture" on every later op); synchronize() here flushes
+                    # the pending error so the degrade has a chance, and if the
+                    # context is truly wedged the next forward raises loudly anyway.
+                    self._verify_graph_enabled = False
+                    self.verify_graph_backend = None
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "verify CUDA-graph capture failed (%s); degrading to eager verify",
+                        _vg_err,
+                    )
             # Main-decode replay path: skip the 24-layer eager loop by replaying the
             # captured graph_runner graph (~10 s saved per step). The graph was
             # captured against the stable GraphCaptureBuffer; we wire its outputs

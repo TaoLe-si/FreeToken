@@ -186,6 +186,12 @@ class MtpDriver:
             # window-only drafts for this round (correct, just less accurate).
             self.head.attn.reset_draft_cache()
             self._cache_owner_uid = uid
+        # FT_MTP_HEAD_NOCACHE=1: window-only drafts (exporter-validated mode --
+        # vmlx_mtp_tuning.json "cache_mode": "off", speedup 1.564x). The head
+        # attends only within the current round's rows; the persistent-KV seeding
+        # path is bypassed entirely.
+        if os.environ.get("FT_MTP_HEAD_NOCACHE") == "1":
+            self.head.attn.reset_draft_cache()
         # Rows present before this round's step-1 row (the committed prefix).
         # Invariant: rows 0..position-1 must be exactly the committed prefix.
         # Stale rows beyond that (left by the previous round commit/draft
