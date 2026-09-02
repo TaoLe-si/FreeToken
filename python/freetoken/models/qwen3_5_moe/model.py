@@ -111,7 +111,7 @@ class Qwen3_5Model(BaseOP):
                     # Marker so forward_with_hidden knows the replay path took over and
                     # the lm_head call there should be skipped (logits already in buffer.logits).
                     _ctx_for_graph.batch.mtp_replayed = True
-                    # Return raw pre-norm hidden for prev_hidden derivation.
+                    # Return the (post-final-norm) hidden for prev_hidden / all_hidden.
                     return _ah_buf[: input_ids.shape[0]], _ah_buf[: input_ids.shape[0]]
                 # If cache is missing, fall through to eager (shouldn't happen).
 
@@ -120,13 +120,15 @@ class Qwen3_5Model(BaseOP):
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
         if return_raw:
-            # Raw (pre-final-norm) hidden: the MTP head's expected input -- it has
-            # its own pre_fc_norm_hidden, so feeding the post-norm hidden would
-            # double-norm. Computed BEFORE the fused add-norm (which mutates the
-            # residual buffer in place).
+            # Official Qwen3.6 MTP convention (vLLM qwen3_next_mtp.py + ORT
+            # onnxruntime-genai qwen-3.6-mtp.md, both validated bit-exact vs the
+            # 88.3% reference): the head consumes the main model's
+            # POST-final-norm hidden state. Return the post-norm output for BOTH
+            # slots (prev_hidden and all_hidden) -- the pre-norm raw value was a
+            # FreeToken-local misreading that capped draft acceptance at ~5%.
             raw = (x + residual) if residual is not None else x
             x, _ = self.norm.forward_add_residual(x, residual)
-            return x, raw
+            return x, x
         x, _ = self.norm.forward_add_residual(x, residual)
         return x
 
@@ -182,11 +184,11 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         output, raw = self.model.forward(batch.input_ids, return_raw=True)
         if batch.size == 0:
             zeros = output.new_zeros((0, output.shape[-1]))
-            return self.lm_head.forward(output), zeros, raw.detach()
+            return self.lm_head.forward(output), zeros, output.detach()
         indices = batch.attn_metadata.get_last_indices(batch.size)
-        # MTP consumes the PRE-final-norm raw hidden -- the head has its own
-        # pre_fc_norm_hidden and was trained against this distribution.
-        prev_hidden = raw[indices].detach()  # [bs, H]
+        # Official convention: the MTP head consumes the POST-final-norm hidden
+        # (see return_raw block above for the authoritative sources).
+        prev_hidden = output[indices].detach()  # [bs, H]
         # If the inner forward already ran the captured graph (set the flag during
         # replay), the lm_head was captured too -- pull logits from buffer.logits
         # instead of re-running lm_head (which would re-trigger a fresh graph).
@@ -197,7 +199,7 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             _logits_buf = getattr(batch, "mtp_logits_buf", None)
             if _logits_buf is not None:
                 logits = _logits_buf[: batch.size].detach()
-                return logits, prev_hidden, raw.detach()
+                return logits, prev_hidden, output.detach()
         logits = self.lm_head.forward(output)
         # Diagnostic (FT_MTP_DIAG=1): compare what the MTP head actually sees vs the
         # last-layer outputs the model produces. We log BOTH the pre-final-norm raw
@@ -230,6 +232,6 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                     f"norm={rw.norm(dim=-1).mean().item():.3f}",
                     flush=True,
                 )
-        return logits, prev_hidden, raw.detach()
+        return logits, prev_hidden, output.detach()
 
 __all__ = ["Qwen3_5MoEForCausalLM"]
