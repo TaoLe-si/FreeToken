@@ -779,16 +779,21 @@ class Engine:
             # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
             # pick (parallel for scattered experts, with a low-RAM fallback to serial).
             expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
-            banks = load_expert_banks(
-                config.model_path,
-                config.model_config,
-                device=self.device,
-                dtype=self.dtype,
-                dummy=config.use_dummy_weight,
-                parallel=expert_parallel,
-                decode_target=("cpu" if decode_target in ("cpu", "hybrid", "igpu") else "gpu"),
-            )
-            if config.moe_cache_auto:
+            # 边复制边删除: iGPU 路径不调 load_expert_banks (避免 17 GB pageable host memory).
+            # igpu_shared_executor.register_banks 会调 stream_ftw_to_gtt 直接进 GTT (peak 64 MB pinned).
+            if decode_target == "igpu":
+                banks = None
+            else:
+                banks = load_expert_banks(
+                    config.model_path,
+                    config.model_config,
+                    device=self.device,
+                    dtype=self.dtype,
+                    dummy=config.use_dummy_weight,
+                    parallel=expert_parallel,
+                    decode_target=("cpu" if decode_target in ("cpu", "hybrid", "igpu") else "gpu"),
+                )
+            if config.moe_cache_auto and banks is not None:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
                 object.__setattr__(config, "moe_cache_size", size)
                 object.__setattr__(config, "moe_prefill_overlap", overlap)
@@ -816,12 +821,17 @@ class Engine:
                 cache_policy=config.moe_cache_policy,
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
-                quant_format=banks.quant_format,
+                quant_format=(banks.quant_format if banks is not None else "nvfp4"),
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
-            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
-            cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            if banks is not None:
+                cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+                cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            else:
+                # 边复制边删除: iGPU stream path 跳过 set_bank_sources (不允许 None tensors)
+                # igpu_shared_executor.register_banks 检测空 bank_sources → 调 stream_ftw_to_gtt
+                cache.folder_path = config.model_path  # stream loader 用此路径
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target

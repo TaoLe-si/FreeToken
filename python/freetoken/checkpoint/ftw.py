@@ -419,6 +419,115 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int = 8,
         raise err[0]
 
 
+
+def stream_ftw_to_gtt(path: str, *, num_layers: int, dll, hip, bank_order: list[str],
+                      chunk: int = 64 * 1024 * 1024) -> dict[str, list]:
+    """Stream-load FTW banks directly into iGPU GTT, never holding full bank in host memory.
+
+    边复制边删除: peak host memory = chunk (default 64 MB pinned).
+    File → small pinned buffer → hipMemcpy H2D → discard buffer.
+
+    Returns {name: [(dev_ptr, nbytes)]} indexed by layer order.
+    """
+    import ctypes
+    from freetoken.utils.progress import byte_bar
+
+    H2D = 1
+    reader = FTWReader(path)
+    bank_entries = reader.entries("experts_bank")
+    row_entries = [e for e in bank_entries if e["name"] not in _ALPHA_NAMES]
+    if not row_entries:
+        reader.close()
+        return None
+
+    flat_entries = [e for e in row_entries if _LAYER_ENTRY_RE.match(e["name"]) is None]
+    if flat_entries:
+        reader.close()
+        raise RuntimeError(
+            f"stream_ftw_to_gtt: FTW bank(s) use flat layout, can't stream: {[e['name'] for e in flat_entries]}"
+        )
+
+    groups: dict[str, dict[int, dict]] = {}
+    for e in row_entries:
+        m = _LAYER_ENTRY_RE.match(e["name"])
+        base = m.group("base")
+        layer_id = int(m.group("layer"))
+        groups.setdefault(base, {})[layer_id] = e
+
+    dev_ptrs: dict[str, list] = {n: [None] * num_layers for n in bank_order}
+    for name in bank_order:
+        if name not in groups:
+            raise RuntimeError(f"stream_ftw_to_gtt: missing bank {name!r}")
+        by_layer = groups[name]
+        if sorted(by_layer) != list(range(num_layers)):
+            raise RuntimeError(f"stream_ftw_to_gtt: bank {name!r} has layers {sorted(by_layer)}")
+        for layer_id in range(num_layers):
+            nbytes = by_layer[layer_id]["nbytes"]
+            # 边复制边删除: 优先用 _IGPU_RESERVED 池
+            from freetoken.moe.igpu_shared_executor import _IGPU_RESERVED
+            if _IGPU_RESERVED:
+                d = _IGPU_RESERVED.pop(0)
+            else:
+                d = dll.igpu_devmalloc(ctypes.c_size_t(nbytes))
+            if not d:
+                raise RuntimeError(f"igpu_devmalloc({nbytes}) failed for {name!r} layer {layer_id}")
+            dev_ptrs[name][layer_id] = (d, nbytes)
+
+    # 边复制边删除: 单一 CUDA pinned tensor (cudaHostAlloc mapped) - 与 hipMemcpy H2D 兼容
+    # 复用: 每次只读一个 chunk 覆盖, 立即 H2D, 内存不累积
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+    import numpy as _np
+    pinned_tensor = alloc_pinned_tensor(chunk, dtype=torch.uint8)
+    pinned_host = pinned_tensor.data_ptr()
+    pinned_dev_ptr = pinned_host  # 在 WDDM 上 cudaHostAlloc(mapped) 的 host VA = device VA (identity)
+    # 临时 np buffer (64 MB, pageable): pread 进来, memcpy 到 pinned
+    _tmp = _np.empty(chunk, dtype=_np.uint8)
+
+    total_bytes = sum(e["nbytes"] for e in row_entries)
+    bar = byte_bar(total_bytes, "Stream-loading banks to iGPU GTT (one chunk in flight)")
+
+    # 边复制边删除: mmap-based (reader._map handles mmap + readahead).
+    # Windows os.open+os.read 在某些 FS 上读不出大块 → 用 mmap。
+    # _pieces(global_off, nbytes) 给 (file, file_off, dest_off, length) 切 shard
+    try:
+        for name in bank_order:
+            by_layer = groups[name]
+            for layer_id in range(num_layers):
+                entry = by_layer[layer_id]
+                dev_ptr, nbytes = dev_ptrs[name][layer_id]
+                cursor = 0
+                while cursor < nbytes:
+                    take = min(chunk, nbytes - cursor)
+                    # 用 _pieces 拿 shard, file_off, dest_off
+                    pieces = list(reader._pieces(entry["global_off"] + cursor, take))
+                    done = 0
+                    for shard_file, file_off, dest_off, length in pieces:
+                        mv = reader._map(shard_file)  # memoryview of shard mmap
+                        # copy shard slice into _tmp numpy (buffer must be writable numpy for memmove)
+                        np_seg = _np.frombuffer(bytes(mv[file_off:file_off + length]), dtype=_np.uint8)
+                        _tmp[done:done + length] = np_seg
+                        done += length
+                    if done != take:
+                        raise OSError(f"short read: {done}/{take}")
+                    ctypes.memmove(pinned_host, _tmp.ctypes.data, take)
+                    rc = hip.hipMemcpy(
+                        ctypes.c_void_p(dev_ptr + cursor),
+                        ctypes.c_void_p(pinned_host),
+                        ctypes.c_size_t(take), H2D,
+                    )
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"hipMemcpy H2D failed rc={rc} for {name!r} layer {layer_id} offset {cursor} size {take}"
+                        )
+                    cursor += take
+                    bar.update(take)
+    finally:
+        bar.close()
+        reader.close()
+
+    return dev_ptrs
+
+
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
     layer_residency: list[str] | None = None,

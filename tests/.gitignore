@@ -1,0 +1,5 @@
+tests/igpu_worker_smoke/
+tests/igpu_worker_smoke4/
+tests/igpu_worker_smoke5/
+tests/igpu_worker_smoke*/
+tests/igpu_worker_smoke*/ring.bin

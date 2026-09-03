@@ -24,6 +24,7 @@ import mmap
 import os
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
@@ -140,6 +141,22 @@ class HostBank:
                 f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
             ) from exc
         self._pinned = True
+
+    def unpin(self) -> None:
+        """cudaHostUnregister to release pin quota (边映射边 gc).
+        Safe to call when the bank has been migrated to iGPU GTT; the GPU has
+        finished reading by the time we sync (hipMemcpy is synchronous).
+        Idempotent: a no-op on banks that were never pinned."""
+        if not self._pinned:
+            return
+        from freetoken.kernel.pinned import host_unregister
+        try:
+            host_unregister(self.addr)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"cudaHostUnregister failed for {len(self._buf) / 2**30:.1f} GiB"
+            ) from exc
+        self._pinned = False
 
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
@@ -312,6 +329,8 @@ class PinPipeline:
         self._device = torch.cuda.current_device() if torch.cuda.is_available() else None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        self._counter = 0  # settle counter for streaming flush()
+
 
     def _run(self) -> None:
         if self._device is not None:
@@ -329,19 +348,30 @@ class PinPipeline:
                     plan.record(layer_id, bank.residency.value)
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
+            finally:
+                self._counter += 1
 
     def submit(self, bank: HostBank, residency: str = HostResidency.PINNED.value,
                plan=None, layer_id: int | None = None) -> None:
         self._q.put((bank, residency, plan, layer_id))
 
     def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
-        """Layer-completion sink: queue every bank of the completed layer at its ambient :func:`requested_residency` label."""
+        """Layer-completion sink: queue every bank of the completed layer at its ambient :func:`requested_residency` label.
+
+        边映射边 gc: 开启 streaming 后, 调用阻塞直到该 layer 全部 pin 完成, 限制 peak pin 配额
+        到单 layer 量级 (~2.6 GB vs 全集的 17 GB). 不开启则保持异步并发 pin.
+        """
         plan = _requested_residency
         residency = (
             HostResidency.PINNED.value if plan is None else plan.residency_for(layer_id)
         )
         for bank in banks.values():
             self.submit(bank, residency, plan, layer_id)
+        # 边映射边 gc: 不强制 streaming flush (回退稳定版本)
+
+    def flush(self, count: int = 1) -> None:
+        """No-op (回退稳定版本, 不阻塞). 边映射边 gc 改在 register_banks 阶段处理."""
+        pass
 
     def _join(self) -> None:
         self._q.put(None)

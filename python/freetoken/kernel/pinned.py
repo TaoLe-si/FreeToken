@@ -49,6 +49,18 @@ def host_register(addr: int, nbytes: int) -> None:
     """cudaHostRegister ``nbytes`` at ``addr`` as portable+mapped (pin-after-fill)."""
     _load_pinned_extension().host_register(addr, nbytes)
 
+def host_unregister(addr: int) -> None:
+    """cudaHostUnregister ``addr`` to release pin quota (边映射边 gc 关键)."""
+    _load_pinned_extension().host_unregister(addr)
+
+def free_pinned_addr(addr: int) -> None:
+    """显式 cudaFreeHost - 释放 cudaHostAlloc'd 内存 (gc.collect 不触发 CUDA driver 立即回收).
+
+    边映射边 gc: register_banks H2D 完成后, host pinned bank 数据已迁到 GTT,
+    可以显式释放 host 内存, 即使 Python refcount 未到 0.
+    """
+    _load_pinned_extension().free_pinned_addr(addr)
+
 
 @lru_cache(maxsize=1)
 def _host_ptr_identity() -> bool:

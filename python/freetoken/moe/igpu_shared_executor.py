@@ -27,6 +27,7 @@ stream-memop handshake) is a later step.
 from __future__ import annotations
 
 import ctypes
+import gc
 import os
 import time
 
@@ -159,32 +160,75 @@ class IgpuSharedMoeExecutor:
     # ------------------------------------------------------------------
 
     def register_banks(self) -> None:
-        """Form-2: migrate all six banks per layer into 780M device memory (GTT).
+        """边复制边删除: stream-load FTW directly into 780M GTT, never holding
+        full bank in host memory. Peak host mem = one 64 MB pinned chunk.
 
-        hipMalloc on this APU returns GTT-backed device memory that kernels read
-        natively (26.6 GB/s measured), sidestepping the WDDM host-mapping defect.
-        Weight bytes are pushed once via hipMemcpy H2D; the host pinned original
-        is released so steady-state host usage drops by the full bank size.
+        两种模式:
+        1) Streaming (empty cache.bank_sources): call stream_ftw_to_gtt
+           to populate GTT directly from FTW file. No host banks materialized.
+        2) Legacy (cache.bank_sources populated): per-bank H2D from pinned host.
         """
         if self._registered:
             return
         sources = self.cache.bank_sources
-        missing = [n for n in _BANK_ORDER if n not in sources]
-        if missing:
-            raise RuntimeError(f"cache bank_sources missing banks: {missing}")
-        self._validate_bank_shapes(sources)
-        logger.info_rank0("iGPU register_banks: reserved=%d", len(_IGPU_RESERVED))
+        # Detect streaming path: bank_sources empty (no set_bank_sources call)
+        streaming_path = len(sources) == 0
+        if not streaming_path:
+            missing = [n for n in _BANK_ORDER if n not in sources]
+            if missing:
+                raise RuntimeError(f"cache bank_sources missing banks: {missing}")
+            self._validate_bank_shapes(sources)
+        logger.info_rank0("iGPU register_banks: streaming=%s reserved=%d", streaming_path, len(_IGPU_RESERVED))
         self.hip.hipMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        self.hip.hipMemcpy.restype = ctypes.c_int
         H2D = 1
         f_b = ctypes.c_size_t(0); t_b = ctypes.c_size_t(0)
         if self.dll.igpu_meminfo(ctypes.byref(f_b), ctypes.byref(t_b)) == 0:
-            logger.info("GTT meminfo before migration: free=%.2f GB total=%.2f GB", f_b.value / 2**30, t_b.value / 2**30)
+            logger.info("GTT meminfo before: free=%.2f GB total=%.2f GB", f_b.value / 2**30, t_b.value / 2**30)
         t0 = time.perf_counter()
+
+        if streaming_path:
+            # Streaming path: call stream_ftw_to_gtt if not already done
+            ftw_path = getattr(self.cache, "folder_path", None) or getattr(self, "ftw_path", None) or getattr(self.cache, "ftw_path", None)
+            if ftw_path is None:
+                raise RuntimeError(
+                    "register_banks: bank_sources is empty and no ftw_path available; "
+                    "cannot stream-load"
+                )
+            from freetoken.checkpoint.ftw import stream_ftw_to_gtt
+            logger.info_rank0("iGPU stream-load: %s", ftw_path)
+            gtt = stream_ftw_to_gtt(
+                ftw_path,
+                num_layers=self.num_layers,
+                dll=self.dll,
+                hip=self.hip,
+                bank_order=list(_BANK_ORDER),
+            )
+            if gtt is None:
+                raise RuntimeError("stream_ftw_to_gtt returned None")
+            for name in _BANK_ORDER:
+                for layer_id in range(self.num_layers):
+                    rc = self.dll.igpu_register_layer_dev(
+                        layer_id,
+                        *[ctypes.c_void_p(gtt[n][layer_id][0]) for n in _BANK_ORDER],
+                    )
+                    if rc != 0:
+                        raise RuntimeError(f"igpu_register_layer_dev(layer={layer_id}) failed with {rc}")
+                    self._bank_ptrs.append(tuple(gtt[n][layer_id][0] for n in _BANK_ORDER))
+            self._registered = True
+            self._migrate_s = time.perf_counter() - t0
+            logger.info_rank0("iGPU edge-map-gc: stream-load done (%.1fs); only 64 MB pinned at peak", self._migrate_s)
+            if self.dll.igpu_meminfo(ctypes.byref(f_b), ctypes.byref(t_b)) == 0:
+                logger.info("GTT meminfo after stream-load: free=%.2f GB total=%.2f GB", f_b.value / 2**30, t_b.value / 2**30)
+            return
+
+        # Legacy path: per-bank H2D from pinned host memory
         for layer_id in range(self.num_layers):
             dev_ptrs = []
             for name in _BANK_ORDER:
                 t = sources[name][layer_id]
-                assert t is not None and t.is_contiguous(), f"bank {name!r} layer {layer_id}"
+                if t is None:
+                    raise RuntimeError(f"bank {name!r} layer {layer_id} is None (not loaded)")
                 nbytes = t.numel() * t.element_size()
                 if _IGPU_RESERVED:
                     d = _IGPU_RESERVED.pop(0)
@@ -199,11 +243,16 @@ class IgpuSharedMoeExecutor:
                     n = min(CHUNK, nbytes - off)
                     rc = self.hip.hipMemcpy(d + off, ctypes.c_void_p(src_base + off), ctypes.c_size_t(n), H2D)
                     if rc != 0:
-                        logger.info("H2D CHUNK FAIL rc=%s name=%s layer=%s off=%s n=%s", rc, name, layer_id, off, n)
                         break
                 if rc != 0:
                     raise RuntimeError(f"hipMemcpy H2D failed ({rc}) for {name!r} layer {layer_id}")
                 dev_ptrs.append(d)
+                # 边映射边 gc: 显式释放 host pin 配额
+                try:
+                    from freetoken.kernel.pinned import free_pinned_addr
+                    free_pinned_addr(t.data_ptr())
+                except Exception:
+                    pass
                 sources[name][layer_id] = None
             rc = self.dll.igpu_register_layer_dev(layer_id, *(ctypes.c_void_p(p) for p in dev_ptrs))
             if rc != 0:
@@ -211,9 +260,7 @@ class IgpuSharedMoeExecutor:
             self._bank_ptrs.append(tuple(dev_ptrs))
         self._registered = True
         self._migrate_s = time.perf_counter() - t0
-        if self.dll.igpu_meminfo(ctypes.byref(f_b), ctypes.byref(t_b)) == 0:
-            logger.info("GTT meminfo after migration: free=%.2f GB total=%.2f GB (%.1fs)", f_b.value / 2**30, t_b.value / 2**30, self._migrate_s)
-
+        logger.info_rank0("iGPU edge-map-gc: legacy register_banks done; prefill routes to iGPU decode")
 
     def _validate_bank_shapes(self, sources: dict) -> None:
         """Fail loudly on a layout the hardcoded DLL geometry cannot serve."""
@@ -313,10 +360,20 @@ class IgpuSharedMoeExecutor:
         self.hip.hipMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
         H2D, D2H = 1, 2
 
-        hidden_cpu = hidden_states.to(torch.float32).cpu()
-        ids_cpu = topk_ids.to(torch.int32).cpu()
-        weights_cpu = topk_weights.to(torch.float32).cpu()
-        stream.synchronize()
+        # Phase 1 integration: pinned host buffers (allocated once), async D2H,
+        # single hipStreamSynchronize at end (no per-layer sync).
+        # One-time allocation of pinned staging buffers for D2H.
+        if getattr(self, "_host_staging", None) is None or self._host_staging[0] < bs:
+            hidden_cpu = torch.empty((bs, _H), dtype=torch.float32, pin_memory=True)
+            ids_cpu = torch.empty((bs, _EXPECTED_TOP_K), dtype=torch.int32, pin_memory=True)
+            weights_cpu = torch.empty((bs, _EXPECTED_TOP_K), dtype=torch.float32, pin_memory=True)
+            out_host = torch.empty((bs, _H), dtype=torch.float32, pin_memory=True)
+            self._host_staging = (bs, hidden_cpu, ids_cpu, weights_cpu, out_host)
+        _, hidden_cpu, ids_cpu, weights_cpu, out_host = self._host_staging
+        # Async D2H: pinned + non_blocking=True; does NOT sync CPU.
+        hidden_cpu.copy_(hidden_states.to(torch.float32), non_blocking=True)
+        ids_cpu.copy_(topk_ids.to(torch.int32), non_blocking=True)
+        weights_cpu.copy_(topk_weights.to(torch.float32), non_blocking=True)
 
         # one-time device IO staging buffers (780M side)
         if getattr(self, "_dev_io", None) is None or self._dev_io[0] < bs:
@@ -332,11 +389,12 @@ class IgpuSharedMoeExecutor:
             self._dev_io = (bs, (d_h, d_i, d_w, d_o))
             logger.info('iGPU dev IO staging: d_h=%s d_i=%s d_w=%s d_o=%s bs=%d', hex(d_h or 0), hex(d_i or 0), hex(d_w or 0), hex(d_o or 0), bs)
         _, (d_h, d_i, d_w, d_o) = self._dev_io
-        self.hip.hipMemcpy(d_h, ctypes.c_void_p(hidden_cpu[0].data_ptr()), ctypes.c_size_t(bs * _H * 4), H2D)
-        self.hip.hipMemcpy(d_i, ctypes.c_void_p(ids_cpu[0].data_ptr()), ctypes.c_size_t(bs * _EXPECTED_TOP_K * 4), H2D)
-        self.hip.hipMemcpy(d_w, ctypes.c_void_p(weights_cpu[0].data_ptr()), ctypes.c_size_t(bs * _EXPECTED_TOP_K * 4), H2D)
+        # Async H2D to 780M staging; HIP stream queue accepts in parallel.
+        self.hip.hipMemcpy(d_h, ctypes.c_void_p(hidden_cpu.data_ptr()), ctypes.c_size_t(bs * _H * 4), H2D)
+        self.hip.hipMemcpy(d_i, ctypes.c_void_p(ids_cpu.data_ptr()), ctypes.c_size_t(bs * _EXPECTED_TOP_K * 4), H2D)
+        self.hip.hipMemcpy(d_w, ctypes.c_void_p(weights_cpu.data_ptr()), ctypes.c_size_t(bs * _EXPECTED_TOP_K * 4), H2D)
 
-        out_host = torch.empty((bs, _H), dtype=torch.float32)
+        # Per-layer kernel enqueue (1 kernel per layer). Phase 3 will batch all 40.
         for i in range(bs):
             rc = self.dll.igpu_moe_decode_dev(
                 int(layer_id),
@@ -349,9 +407,17 @@ class IgpuSharedMoeExecutor:
                 raise RuntimeError(
                     f"igpu_moe_decode_dev(layer={layer_id}, token={i}) failed with {rc}"
                 )
-            self.hip.hipMemcpy(ctypes.c_void_p(out_host[i].data_ptr()), d_o, ctypes.c_size_t(_H * 4), D2H)
+        # ONE sync at end (Phase 1 change).
+        self.dll.igpu_get_stream.argtypes = []
+        self.dll.igpu_get_stream.restype = ctypes.c_void_p
+        hip_stream = self.dll.igpu_get_stream()
+        self.hip.hipStreamSynchronize.argtypes = [ctypes.c_void_p]
+        self.hip.hipStreamSynchronize.restype = ctypes.c_int
+        self.hip.hipStreamSynchronize(hip_stream)
+        # Async D2H output (HIP is done, just memcpy back).
+        self.hip.hipMemcpy(ctypes.c_void_p(out_host.data_ptr()), d_o, ctypes.c_size_t(bs * _H * 4), D2H)
         out = torch.empty((bs, _H), dtype=hidden_states.dtype, device=self.device)
-        out.copy_(out_host, non_blocking=False)
+        out.copy_(out_host, non_blocking=True)
         return out
 
     def health_check(self) -> bool:

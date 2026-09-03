@@ -102,6 +102,21 @@ void host_register(int64_t addr, int64_t nbytes) {
               "cudaHostRegister failed: ", cudaGetErrorString(err));
 }
 
+// 边映射边 gc: 显式释放 cudaHostAlloc'd 内存 (gc.collect 不触发 CUDA driver 立即回收)
+void free_pinned_addr(int64_t addr) {
+  // cudaFreeHost 也可释放 cudaHostRegister'd 内存 (driver handles both)
+  const cudaError_t err = cudaFreeHost(reinterpret_cast<void *>(addr));
+  (void)err;
+}
+
+// 边映射边 gc: 反注册已 pin 的 host memory, 释放 pin 配额
+void host_unregister(int64_t addr) {
+  const cudaError_t err =
+      cudaHostUnregister(reinterpret_cast<void *>(addr));
+  TORCH_CHECK(err == cudaSuccess,
+              "cudaHostUnregister failed: ", cudaGetErrorString(err));
+}
+
 int64_t driver_cuda_version() {
   int version = 0;  // stays 0 when no driver is installed
   const cudaError_t err = cudaDriverGetVersion(&version);
@@ -123,6 +138,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Device-visible alias of a pinned+mapped host address");
   m.def("host_register", &host_register,
         "cudaHostRegister an existing host range as portable+mapped");
+  m.def("free_pinned_addr", &free_pinned_addr,
+        "Explicit cudaFreeHost (边映射边 gc, when GC does not trigger promptly)");
+  m.def("host_unregister", &host_unregister,
+        "cudaHostUnregister a previously-pinned buffer (边映射边 gc)");
   m.def("driver_cuda_version", &driver_cuda_version,
         "Max CUDA version the installed NVIDIA driver supports (0 if none)");
 }

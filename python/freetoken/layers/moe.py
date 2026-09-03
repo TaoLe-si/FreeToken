@@ -396,9 +396,18 @@ class OffloadMoELayer(MoELayer):
         """Prefill movement: stream whole layers -- double-buffered behind the
         previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
         ``materialize_layer``. In both, position == expert id, so the routing ids
-        pass through unmapped."""
+        pass through unmapped.
+
+        边映射边 gc: iGPU shared 后端不需 host pinned bank (decode 直读 GTT), prefill 也走 iGPU decode,
+        跳过 copy_missing (避免 17 GB pin OOM).
+        """
         cache = self.offload_cache
         assert cache is not None
+        if cache.is_igpu_shared_layer(self.layer_id):
+            # 边映射边 gc: iGPU 共享池路径, decode 已验证可用, prefill 复用同入口.
+            # 缺点: 每 layer 一次 sync; 优点: 无需 pinned bank.
+            executor = cache.igpu_shared_executor
+            return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(

@@ -224,6 +224,11 @@ static float* d_act = nullptr;
 static float* d_out = nullptr;
 static float* g_h_out = nullptr;
 static hipStream_t g_stream = nullptr;
+
+// Phase 1: 暴露 stream 句柄给 Python, 调用方自己 sync
+DLLEXPORT hipStream_t igpu_get_stream(void) {
+    return g_stream;
+}
 static int g_init = 0;
 
 DLLEXPORT int igpu_meminfo(size_t* free_b, size_t* total_b) {
@@ -340,7 +345,7 @@ DLLEXPORT int igpu_moe_decode_dev(int layer,
                        b.dn_pack, b.dn_scale, b.dn_global, d_act, topkw, topk_ids, out);
     hipError_t le = hipGetLastError();
     if (le != hipSuccess) { diag("launch err: %s\n", hipGetErrorString(le)); return -3; }
-    CHK(hipStreamSynchronize(g_stream));
+    // Phase 1: 移除 hipStreamSynchronize, 调用方控制 sync 时机 (允许 HIP stream queue)
     return 0;
 }
 
