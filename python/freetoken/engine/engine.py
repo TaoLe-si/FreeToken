@@ -1439,7 +1439,8 @@ class Engine:
                     # replay off under MTP.
                     and (not getattr(self.config, "mtp", False)
                          or getattr(self, "cpu_moe_executor", None) is not None
-                         or getattr(self, "igpu_shared_executor", None) is not None)
+                         or (getattr(self, "igpu_shared_executor", None) is not None
+                             and getattr(self.igpu_shared_executor, "graph_replay_safe", True)))
                     and self.graph_runner.can_use_cuda_graph(batch)
                     and getattr(self.graph_runner, "_captures_hidden", False)
                 ):

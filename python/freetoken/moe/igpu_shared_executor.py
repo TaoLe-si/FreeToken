@@ -73,6 +73,15 @@ class IgpuSharedMoeExecutor:
     """Cross-process iGPU MoE executor. Spawns an HIP worker subprocess and
     routes per-layer decode through it via TCP loopback."""
 
+    # The cross-process decode is fundamentally not graph-replayable: the
+    # captured graph would replay only the D2H/H2D memcpys around our pinned
+    # staging buffers and skip the TCP send/recv + worker kernel call (those
+    # are CPU-side ops that don't get recorded), so on replay the output
+    # GPU tensor would carry stale data from the capture-time call. The
+    # engine checks this flag in its graph_runner.can_use_cuda_graph branch
+    # to fall back to eager decode for this executor.
+    graph_replay_safe = False
+
     def __init__(self, cache, device, num_layers, num_experts, top_k=_TOPK) -> None:
         self.cache = cache
         self.device = device
@@ -88,13 +97,6 @@ class IgpuSharedMoeExecutor:
             raise NotImplementedError(
                 f"igpu executor reads nvfp4 banks, cache is {self.quant_format!r}"
             )
-
-        # The cross-process decode is fundamentally incompatible with CUDA
-        # graph replay: the captured graph would replay just the D2H/H2D memcpys
-        # around our staging buffers and skip the TCP send/recv + worker kernel,
-        # so on replay the output tensor would carry stale data from the capture
-        # call. Disable graph capture entirely so decode runs eagerly through us.
-        os.environ.setdefault("FT_SKIP_CUDA_GRAPH", "1")
 
         self._registered = False
         self._proc = None
