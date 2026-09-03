@@ -316,13 +316,18 @@ class IgpuSharedMoeExecutor:
             try:
                 self._sock.sendall(len(req).to_bytes(4, "little") + req)
                 got = 0
-                out_bytes = bytes(out_buf[:bs].numpy())
-                view = memoryview(out_bytes)
+                # recv_into needs a writable buffer; pinned tensors don't expose
+                # one through numpy, so receive into a plain bytearray then copy
+                # the rows back into the pinned staging.
+                resp_buf = bytearray(total_resp)
                 while got < total_resp:
-                    n = self._sock.recv_into(view[got:], total_resp - got)
+                    n = self._sock.recv_into(memoryview(resp_buf)[got:], total_resp - got)
                     if n == 0:
                         raise RuntimeError("igpu worker closed socket during recv")
                     got += n
+                # Copy bytes -> pinned float32 staging
+                out_np = np.frombuffer(resp_buf, dtype=np.float32).reshape(n_tokens, _H).copy()
+                out_buf[:bs].copy_(torch.from_numpy(out_np), non_blocking=True)
             except OSError as e:
                 raise RuntimeError("igpu worker IPC failed: " + str(e)) from e
 
