@@ -1,22 +1,21 @@
-"""HIP worker process -- the iGPU side of the MoE pipeline.
+"""HIP worker process -- iGPU side of the MoE pipeline (Form-2 cross-process).
 
-This module is run as a subprocess by the engine supervisor. It deliberately
-does NOT import torch or any other CUDA library: doing so would re-create the
-WDDM KMD defect that makes hipMemcpy H2D return rc=1 in the engine process
-(see HIP_WORKER_PITFALLS.md).
+Per-layer decode: engine sends (layer_id, hidden, topk_ids, topk_weights)
+for one (or several) tokens; worker runs a single igpu_moe_decode_dev
+for the requested layer and returns the H-dim output.
+
+This module is run as subprocess by the engine (via IgpuSharedMoeExecutor).
+It deliberately does NOT import torch -- doing so would re-create the WDDM
+KMD defect (HIP_WORKER_PITFALLS.md).
 
 Lifecycle:
-1. Set up ROCm DLL search path (os.add_dll_directory) before any HIP load.
-2. Load amdhip64_6.dll + hip_moe_dll.dll.
-3. Open the shared ring file created by the engine (supervisor passes the path).
-4. Stream-load FTW banks into hipMalloc'd GTT (H2D succeeds here -- no CUDA).
-5. Register all 40 layers with igpu_register_layer_dev.
-6. Allocate per-request device-side staging buffers (hidden / ids / weights / out_hidden).
-7. Loop: wait for engine request, run 40 x igpu_moe_decode_dev, publish result.
-8. On SIGTERM / SIGINT: drain ring (best effort), exit 0.
-
-The worker prints structured log lines to stdout that the daemon captures
-and forwards to the engine log; it does not write to any file itself.
+  1. Set ROCm DLL search path
+  2. Load amdhip64_6.dll + hip_moe_dll.dll, igpu_init
+  3. Bind TCP listener on 127.0.0.1:<port>
+  4. Stream FTW banks into GTT (H2D succeeds here -- no CUDA)
+  5. Per-request: read length-prefixed frame, run kernel for requested
+     layer, write length-prefixed response
+  6. On shutdown: drain, exit 0
 """
 
 from __future__ import annotations
@@ -32,29 +31,30 @@ import struct
 import sys
 import time
 
-# IMPORTANT: do not import torch at module top level. numpy is OK because it
-# does not pull CUDA. See HIP_WORKER_PITFALLS.md for the rationale.
+import numpy as np
 
 from freetoken.igpu.protocol import (
     DEFAULT_PORT,
-    H_DIM,
     IpcError,
-    TOPK,
     WorkerSide,
-    pack_response,
-    unpack_request,
 )
 
 
+_H = 2048
+_TOPK = 8
+_REQUEST_BYTES = 1 + _H * 4 + _TOPK * 4 + _TOPK * 4  # 8257
+_RESPONSE_BYTES = _H * 4  # 8192
+
+
 def _setup_rocm_path() -> None:
-    candidates = [
+    candidates = (
         r"C:\Program Files\AMD\ROCm\6.4\bin",
         r"C:\Program Files\AMD\ROCm\6.3\bin",
         r"C:\Program Files\AMD\ROCm\6.2\bin",
         r"C:\Program Files\AMD\ROCm\6.1\bin",
         r"C:\Program Files\AMD\ROCm\6.0\bin",
         r"C:\Program Files\AMD\ROCm\5.7\bin",
-    ]
+    )
     for p in candidates:
         if os.path.isdir(p):
             try:
@@ -88,6 +88,8 @@ def _load_dlls() -> tuple:
 
     hip.hipMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
     hip.hipMemcpy.restype = ctypes.c_int
+    hip.hipStreamSynchronize.argtypes = [ctypes.c_void_p]
+    hip.hipStreamSynchronize.restype = ctypes.c_int
 
     dll.igpu_init.argtypes = []
     dll.igpu_init.restype = ctypes.c_int
@@ -105,25 +107,27 @@ def _load_dlls() -> tuple:
     return hip, dll
 
 
-def _alloc_staging(dll, slot_count=8):
-    hidden_b = H_DIM * 4
-    ids_b = TOPK * 4
-    wts_b = TOPK * 4
-    out_b = H_DIM * 4
+def _alloc_staging(dll, slot_count: int = 8):
+    """Per-request device-side staging buffers (GTT). Reused across requests."""
+    hidden_b = _H * 4
+    ids_b = _TOPK * 4
+    wts_b = _TOPK * 4
+    out_b = _H * 4
     slots = []
     for _ in range(slot_count):
         slots.append({
             "hidden": (dll.igpu_devmalloc(ctypes.c_size_t(hidden_b)), hidden_b),
-            "ids":    (dll.igpu_devmalloc(ctypes.c_size_t(ids_b)),    ids_b),
-            "wts":    (dll.igpu_devmalloc(ctypes.c_size_t(wts_b)),    wts_b),
-            "out":    (dll.igpu_devmalloc(ctypes.c_size_t(out_b)),    out_b),
+            "ids": (dll.igpu_devmalloc(ctypes.c_size_t(ids_b)), ids_b),
+            "wts": (dll.igpu_devmalloc(ctypes.c_size_t(wts_b)), wts_b),
+            "out": (dll.igpu_devmalloc(ctypes.c_size_t(out_b)), out_b),
         })
     return slots
 
 
 def _stream_ftw_to_gtt(path, dll, hip):
-    import numpy as np
+    """Stream FTW banks into GTT (no host materialisation)."""
     from freetoken.checkpoint.ftw import FTWReader
+
     reader = FTWReader(path)
     bank_entries = reader.entries("experts_bank")
     alpha_names = {"gate_up_alpha", "down_alpha"}
@@ -146,7 +150,8 @@ def _stream_ftw_to_gtt(path, dll, hip):
             raise RuntimeError("FTW missing bank " + repr(b))
     for b in expected:
         if set(by_layer[b].keys()) != set(range(len(by_layer[expected[0]]))):
-            raise RuntimeError("FTW bank " + repr(b) + " has wrong layers: " + str(sorted(by_layer[b])))
+            raise RuntimeError("FTW bank " + repr(b) + " has wrong layers: " +
+                               str(sorted(by_layer[b])))
 
     num_layers = len(by_layer[expected[0]])
     ptrs = []
@@ -163,9 +168,6 @@ def _stream_ftw_to_gtt(path, dll, hip):
             cursor = 0
             while cursor < nbytes:
                 take = min(CHUNK, nbytes - cursor)
-                # Build a fresh numpy staging buffer per chunk; release it
-                # before reader.close() so its pointer doesn't pin the shard
-                # mmap on Windows.
                 staging = np.empty(take, dtype=np.uint8)
                 pieces = list(reader._pieces(entry["global_off"] + cursor, take))
                 for shard_file, file_off, _dest_off, length in pieces:
@@ -175,20 +177,15 @@ def _stream_ftw_to_gtt(path, dll, hip):
                 rc = hip.hipMemcpy(
                     ctypes.c_void_p(layer_ptrs[-1] + cursor),
                     ctypes.c_void_p(staging.ctypes.data),
-                    ctypes.c_size_t(take),
-                    1,
+                    ctypes.c_size_t(take), 1,
                 )
                 del staging, pieces
                 if rc != 0:
-                    raise RuntimeError("hipMemcpy H2D failed rc=" + str(rc) + " for " + repr(b) + " L" + str(L))
+                    raise RuntimeError("hipMemcpy H2D failed rc=" + str(rc) +
+                                       " for " + repr(b) + " L" + str(L))
                 cursor += take
         ptrs.append(tuple(layer_ptrs))
 
-    # Release any remaining memoryviews from the reader before closing.
-    # On Windows, mmap.mmap.close() refuses to release while any view is
-    # alive (even a parent memoryview that has been "released" can keep the
-    # underlying file mapping alive). Drop _maps + _fds, force GC, then
-    # close.
     try:
         for m, mv in list(reader._maps.values()):
             try:
@@ -207,7 +204,6 @@ def _stream_ftw_to_gtt(path, dll, hip):
         reader.close()
     except Exception as e:
         _log("WARN", "reader close raised", error=str(e))
-        pass
     return ptrs
 
 
@@ -232,6 +228,28 @@ def _set_signal_handlers(state):
             pass
 
 
+def _send_exact(sock, data):
+    view = memoryview(data)
+    sent = 0
+    while sent < len(view):
+        n = sock.send(view[sent:])
+        if n == 0:
+            raise IpcError("socket closed mid-send")
+        sent += n
+
+
+def _recv_exact(sock, n):
+    chunks = []
+    remaining = n
+    while remaining > 0:
+        buf = sock.recv(remaining)
+        if not buf:
+            raise IpcError("socket closed mid-recv")
+        chunks.append(buf)
+        remaining -= len(buf)
+    return b"".join(chunks)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--ftw", required=True)
@@ -254,29 +272,40 @@ def main(argv=None):
         return 2
     _log("INFO", "hip runtime ready")
 
-    ipc = WorkerSide(port=args.port)
-    try:
-        ipc.connect(slot_count=8, timeout_s=120.0)
-    except IpcError as e:
-        _log("ERROR", "ipc connect failed", error=str(e))
-        return 2
-    _log("INFO", "ipc connected")
+    # Listen
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", args.port))
+    listener.listen(1)
+    listener.settimeout(300.0)
+    _log("INFO", "listening", port=args.port)
 
+    # Wait for connection
+    try:
+        conn, addr = listener.accept()
+    except socket.timeout:
+        _log("ERROR", "accept timeout")
+        return 3
+    listener.close()
+    conn.settimeout(60.0)
+    _log("INFO", "ipc connected", addr=str(addr))
+
+    # Stream FTW
     t0 = time.perf_counter()
     try:
         ptrs = _stream_ftw_to_gtt(args.ftw, dll, hip)
     except Exception as e:
         _log("ERROR", "ftw stream failed", error=str(e))
-        return 3
+        return 4
     _log("INFO", "ftw streamed", layers=len(ptrs), seconds=round(time.perf_counter() - t0, 2))
 
     for L, p in enumerate(ptrs):
         rc = dll.igpu_register_layer_dev(ctypes.c_int(L), *map(ctypes.c_void_p, p))
         if rc != 0:
             _log("ERROR", "register failed", layer=L, rc=rc)
-            return 4
+            return 5
 
-    staging = _alloc_staging(dll, slot_count=8)
+    staging = _alloc_staging(dll, slot_count=4)
     _log("INFO", "staging allocated", slots=len(staging))
 
     loop = {"shutdown": False}
@@ -284,98 +313,115 @@ def main(argv=None):
 
     H2D = 1
     D2H = 2
-    requests_handled = 0
-    kernel_ms_avg = 0.0
 
     _log("INFO", "ready for requests")
 
-    ipc._sock.settimeout(0.5)
+    requests_handled = 0
+    kernel_us_total = 0
     while not loop["shutdown"]:
         try:
-            payload = ipc.recv_request()
-        except IpcError:
+            raw_len = _recv_exact(conn, 4)
+            req_len = struct.unpack("<I", raw_len)[0]
+        except (IpcError, OSError) as e:
+            _log("INFO", "client closed", error=str(e))
             break
-        except socket.timeout:
-            continue
-        except OSError as e:
-            _log("WARN", "recv error", error=str(e))
-            break
+        if req_len % _REQUEST_BYTES != 0:
+            _log("ERROR", "bad request size", size=req_len)
+            return 6
+        n_tokens = req_len // _REQUEST_BYTES
+        payload = _recv_exact(conn, req_len)
 
+        # Parse each token's request
         slot_idx = requests_handled % len(staging)
-        hidden, ids, wts, token_id, request_id, seq = unpack_request(payload)
-
         s = staging[slot_idx]
         h_dev, h_b = s["hidden"]
         i_dev, i_b = s["ids"]
         w_dev, w_b = s["wts"]
         o_dev, o_b = s["out"]
 
-        hidden_bytes = struct.pack(f"<{H_DIM}f", *hidden)
-        ids_bytes = struct.pack(f"<{TOPK}i", *ids)
-        wts_bytes = struct.pack(f"<{TOPK}f", *wts)
-        staging_hidden = (ctypes.c_uint8 * h_b).from_buffer_copy(hidden_bytes)
-        staging_ids = (ctypes.c_uint8 * i_b).from_buffer_copy(ids_bytes)
-        staging_wts = (ctypes.c_uint8 * w_b).from_buffer_copy(wts_bytes)
+        out_buf = bytearray(n_tokens * _RESPONSE_BYTES)
+        H2D_total_us = 0
+        D2H_total_us = 0
+        kernel_total_us = 0
 
-        rc = hip.hipMemcpy(ctypes.c_void_p(h_dev), ctypes.c_void_p(ctypes.addressof(staging_hidden)),
-                           ctypes.c_size_t(h_b), H2D)
-        if rc != 0:
-            _log("ERROR", "H2D hidden failed", rc=rc)
-            break
-        rc = hip.hipMemcpy(ctypes.c_void_p(i_dev), ctypes.c_void_p(ctypes.addressof(staging_ids)),
-                           ctypes.c_size_t(i_b), H2D)
-        if rc != 0:
-            _log("ERROR", "H2D ids failed", rc=rc)
-            break
-        rc = hip.hipMemcpy(ctypes.c_void_p(w_dev), ctypes.c_void_p(ctypes.addressof(staging_wts)),
-                           ctypes.c_size_t(w_b), H2D)
-        if rc != 0:
-            _log("ERROR", "H2D wts failed", rc=rc)
-            break
+        for t in range(n_tokens):
+            base = t * _REQUEST_BYTES
+            layer_id = payload[base]
+            hidden = payload[base + 1:base + 1 + _H * 4]
+            ids = payload[base + 1 + _H * 4:base + 1 + _H * 4 + _TOPK * 4]
+            wts = payload[base + 1 + _H * 4 + _TOPK * 4:base + _REQUEST_BYTES]
 
-        t_kernel = time.perf_counter()
-        for L in range(args.num_layers):
+            t0 = time.perf_counter()
+            rc = hip.hipMemcpy(h_dev, ctypes.c_void_p(ctypes.addressof(
+                (ctypes.c_uint8 * h_b).from_buffer_copy(hidden))),
+                ctypes.c_size_t(h_b), H2D)
+            if rc != 0:
+                _log("ERROR", "H2D hidden failed", rc=rc, token=t)
+                return 7
+            rc = hip.hipMemcpy(i_dev, ctypes.c_void_p(ctypes.addressof(
+                (ctypes.c_uint8 * i_b).from_buffer_copy(ids))),
+                ctypes.c_size_t(i_b), H2D)
+            if rc != 0:
+                _log("ERROR", "H2D ids failed", rc=rc)
+                return 7
+            rc = hip.hipMemcpy(w_dev, ctypes.c_void_p(ctypes.addressof(
+                (ctypes.c_uint8 * w_b).from_buffer_copy(wts))),
+                ctypes.c_size_t(w_b), H2D)
+            if rc != 0:
+                _log("ERROR", "H2D wts failed", rc=rc)
+                return 7
+            H2D_total_us += int((time.perf_counter() - t0) * 1e6)
+
+            # Run single layer
+            t0 = time.perf_counter()
             rc = dll.igpu_moe_decode_dev(
-                ctypes.c_int(L),
+                ctypes.c_int(layer_id),
                 ctypes.c_void_p(h_dev),
                 ctypes.c_void_p(i_dev),
                 ctypes.c_void_p(w_dev),
                 ctypes.c_void_p(o_dev),
             )
             if rc != 0:
-                _log("ERROR", "moe decode failed", layer=L, rc=rc)
-                break
-            h_dev, o_dev = o_dev, h_dev
-        kernel_ms = (time.perf_counter() - t_kernel) * 1000.0
-        kernel_ms_avg = kernel_ms_avg * 0.9 + kernel_ms * 0.1
+                _log("ERROR", "moe decode failed", layer=layer_id, rc=rc)
+                return 8
+            kernel_total_us += int((time.perf_counter() - t0) * 1e6)
 
-        final_out = o_dev if h_dev == staging[slot_idx]["hidden"][0] else h_dev
-        out_bytes = (ctypes.c_uint8 * H_DIM * 4)()
-        rc = hip.hipMemcpy(ctypes.c_void_p(ctypes.addressof(out_bytes)),
-                           ctypes.c_void_p(final_out),
-                           ctypes.c_size_t(H_DIM * 4), D2H)
-        if rc != 0:
-            _log("ERROR", "D2H out failed", rc=rc)
-            break
-        out_arr = (ctypes.c_float * H_DIM).from_buffer(out_bytes)
-        resp_payload = pack_response(list(out_arr), rc=0, latency_us=int(kernel_ms * 1000))
+            # D2H output
+            t0 = time.perf_counter()
+            out_bytes = (ctypes.c_uint8 * _RESPONSE_BYTES).from_buffer(out_buf, t * _RESPONSE_BYTES)
+            rc = hip.hipMemcpy(
+                ctypes.c_void_p(ctypes.addressof(out_bytes)),
+                ctypes.c_void_p(o_dev),
+                ctypes.c_size_t(_RESPONSE_BYTES), D2H,
+            )
+            if rc != 0:
+                _log("ERROR", "D2H out failed", rc=rc)
+                return 9
+            D2H_total_us += int((time.perf_counter() - t0) * 1e6)
 
+        # Sync once per request
+        stream_handle = dll.igpu_get_stream()
+        hip.hipStreamSynchronize(stream_handle)
+
+        # Send response
         try:
-            ipc.send_response(resp_payload)
-        except IpcError as e:
+            _send_exact(conn, struct.pack("<I", len(out_buf)) + bytes(out_buf))
+        except (IpcError, OSError) as e:
             _log("WARN", "send response failed", error=str(e))
             break
 
         requests_handled += 1
         if requests_handled % 50 == 1:
-            _log("INFO", "heartbeat", requests=requests_handled, kernel_ms=round(kernel_ms_avg, 2))
+            _log("INFO", "heartbeat", requests=requests_handled,
+                 h2d_us=H2D_total_us, kernel_us=kernel_total_us, d2h_us=D2H_total_us)
 
     try:
-        ipc.close()
+        conn.close()
     except Exception:
         pass
     _log("INFO", "shutting down", handled=requests_handled)
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
