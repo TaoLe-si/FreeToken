@@ -285,6 +285,9 @@ class IgpuSharedMoeExecutor:
         hid_buf[:bs].copy_(hidden_states.to(torch.float32), non_blocking=True)
         ids_buf[:bs].copy_(topk_ids.to(torch.int32), non_blocking=True)
         wts_buf[:bs].copy_(topk_weights.to(torch.float32), non_blocking=True)
+        # async D2H submitted; sync current stream so pinned bytes are visible
+        # before we read them on the host (send to worker over TCP).
+        torch.cuda.current_stream().synchronize()
 
         # Pack: 1B layer_id + 8192B hidden + 32B ids + 32B weights per token
         if bs == 1:
@@ -333,4 +336,5 @@ class IgpuSharedMoeExecutor:
 
         out = torch.empty((bs, _H), dtype=hidden_states.dtype, device=self.device)
         out.copy_(out_buf[:bs], non_blocking=True)
+        torch.cuda.current_stream().synchronize()
         return out
