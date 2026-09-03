@@ -332,6 +332,35 @@ def main(argv=None):
 
     requests_handled = 0
     kernel_us_total = 0
+    # Watchdog: if a single request (HIP kernel + H2D + D2H + sync) takes
+    # more than WATCHDOG_S, log it loudly and kill ourselves. Without this,
+    # a HIP deadlock on large bs leaves the engine's blocking recv_into
+    # hanging forever (no socket timeout on the engine side) and the daemon
+    # goes unresponsive. Worker dying causes recv_into -> EOF on the engine
+    # -> RuntimeError -> engine init fails fast instead of hanging.
+    WATCHDOG_S = float(os.environ.get("FT_IGPU_WATCHDOG_S", "30"))
+    _req_watchdog = {"start": 0.0, "fired": False}
+    def _wd_kill():
+        if _req_watchdog["start"] > 0 and (time.perf_counter() - _req_watchdog["start"]) >= WATCHDOG_S:
+            _req_watchdog["fired"] = True
+            elapsed = time.perf_counter() - _req_watchdog["start"]
+            _log("ERROR", "request watchdog tripped", elapsed_s=round(elapsed, 2), limit_s=WATCHDOG_S)
+            # Force-exit so the engine sees the socket close (recv_into -> 0)
+            os._exit(11)
+    def _wd_arm():
+        _req_watchdog["start"] = time.perf_counter()
+        _req_watchdog["fired"] = False
+        t = threading.Timer(WATCHDOG_S, _wd_kill)
+        t.daemon = True
+        t.start()
+        return t
+    def _wd_disarm(timer):
+        try:
+            timer.cancel()
+        except Exception:
+            pass
+        _req_watchdog["start"] = 0.0
+
     while not loop["shutdown"]:
         try:
             raw_len = _recv_exact(conn, 4)
@@ -346,6 +375,7 @@ def main(argv=None):
         payload = _recv_exact(conn, req_len)
 
         # Parse each token's request
+        _wd_timer = _wd_arm()
         slot_idx = requests_handled % len(staging)
         s = staging[slot_idx]
         h_dev, h_b = s["hidden"]
@@ -442,6 +472,7 @@ def main(argv=None):
             return 9
         D2H_total_us += int((time.perf_counter() - t0) * 1e6)
 
+        _wd_disarm(_wd_timer)
         # Send response
         try:
             _send_exact(conn, struct.pack("<I", len(out_buf)) + bytes(out_buf))
@@ -450,7 +481,7 @@ def main(argv=None):
             break
 
         requests_handled += 1
-        if requests_handled % 50 == 1:
+        if requests_handled % 10 == 1:
             _log("INFO", "heartbeat", requests=requests_handled,
                  h2d_us=H2D_total_us, kernel_us=kernel_total_us, d2h_us=D2H_total_us)
 
