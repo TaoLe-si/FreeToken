@@ -24,6 +24,7 @@ import os
 import socket as _socket
 import subprocess
 import sys
+import struct
 import threading
 import time
 
@@ -134,8 +135,14 @@ class IgpuSharedMoeExecutor:
         while time.monotonic() < deadline:
             try:
                 s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                # No timeout: blocking mode. Decode may legitimately take
+                # several seconds for large bs (e.g. warmup_prefill at bs=128:
+                # 128 tokens x 0.5 ms kernel + 5 prefill lengths x 40 layers
+                # = several seconds of TCP-loopback work). If the worker dies
+                # the OS closes the socket and recv_into returns 0 (EOF), which
+                # we already detect and raise on.
+                s.settimeout(None)
                 s.connect(("127.0.0.1", self._port))
-                s.settimeout(60.0)
                 self._sock = s
                 break
             except OSError as e:
@@ -318,11 +325,26 @@ class IgpuSharedMoeExecutor:
         with self._lock:
             try:
                 self._sock.sendall(len(req).to_bytes(4, "little") + req)
-                got = 0
+                # Worker prepends a 4-byte little-endian length to every
+                # response. Read it first, otherwise recv_into(total_resp)
+                # eats the length prefix as response data (silent corruption).
+                hdr = bytearray(4)
+                got_hdr = 0
+                while got_hdr < 4:
+                    n = self._sock.recv_into(memoryview(hdr)[got_hdr:], 4 - got_hdr)
+                    if n == 0:
+                        raise RuntimeError("igpu worker closed socket during recv (header)")
+                    got_hdr += n
+                resp_len = struct.unpack("<I", bytes(hdr))[0]
+                if resp_len != total_resp:
+                    raise RuntimeError(
+                        f"igpu worker response length {resp_len} != expected {total_resp}"
+                    )
                 # recv_into needs a writable buffer; pinned tensors don't expose
                 # one through numpy, so receive into a plain bytearray then copy
                 # the rows back into the pinned staging.
                 resp_buf = bytearray(total_resp)
+                got = 0
                 while got < total_resp:
                     n = self._sock.recv_into(memoryview(resp_buf)[got:], total_resp - got)
                     if n == 0:

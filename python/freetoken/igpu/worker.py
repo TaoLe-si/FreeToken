@@ -358,64 +358,89 @@ def main(argv=None):
         D2H_total_us = 0
         kernel_total_us = 0
 
+        # Batched H2D: instead of n_tokens x 3 per-token hipMemcpy calls
+        # (each ctypes round-trip is ~50us, so bs=128 was 19ms just on
+        # Python overhead), do ONE big H2D per tensor. Layout in payload:
+        #   [layer_id_0 | hidden_0 | ids_0 | wts_0 | layer_id_1 | ... ]
+        # so the per-token hidden/ids/wts are at fixed strides; we view
+        # the whole payload as three interleaved streams and hand those to
+        # one big hipMemcpy each.
+        total_hidden_b = n_tokens * _H * 4
+        total_ids_b = n_tokens * _TOPK * 4
+        total_wts_b = n_tokens * _TOPK * 4
+        # View the contiguous tail of payload as the three streams:
+        # stride is _REQUEST_BYTES per token; first byte of each token is
+        # the layer_id (1B), then the three payloads.
+        # Easiest: build a contiguous staging for each and one hipMemcpy.
+        h_stage = bytearray(total_hidden_b)
+        i_stage = bytearray(total_ids_b)
+        w_stage = bytearray(total_wts_b)
+        for t in range(n_tokens):
+            base = t * _REQUEST_BYTES
+            h_off = t * _H * 4
+            i_off = t * _TOPK * 4
+            w_off = t * _TOPK * 4
+            h_stage[h_off:h_off + _H * 4] = payload[base + 1:base + 1 + _H * 4]
+            i_stage[i_off:i_off + _TOPK * 4] = payload[base + 1 + _H * 4:base + 1 + _H * 4 + _TOPK * 4]
+            w_stage[w_off:w_off + _TOPK * 4] = payload[base + 1 + _H * 4 + _TOPK * 4:base + _REQUEST_BYTES]
+
+        t0 = time.perf_counter()
+        rc = hip.hipMemcpy(h_dev, ctypes.c_void_p(ctypes.addressof(
+            (ctypes.c_uint8 * total_hidden_b).from_buffer_copy(h_stage))),
+            ctypes.c_size_t(total_hidden_b), H2D)
+        if rc != 0:
+            _log("ERROR", "H2D hidden failed", rc=rc, n_tokens=n_tokens)
+            return 7
+        rc = hip.hipMemcpy(i_dev, ctypes.c_void_p(ctypes.addressof(
+            (ctypes.c_uint8 * total_ids_b).from_buffer_copy(i_stage))),
+            ctypes.c_size_t(total_ids_b), H2D)
+        if rc != 0:
+            _log("ERROR", "H2D ids failed", rc=rc)
+            return 7
+        rc = hip.hipMemcpy(w_dev, ctypes.c_void_p(ctypes.addressof(
+            (ctypes.c_uint8 * total_wts_b).from_buffer_copy(w_stage))),
+            ctypes.c_size_t(total_wts_b), H2D)
+        if rc != 0:
+            _log("ERROR", "H2D wts failed", rc=rc)
+            return 7
+        H2D_total_us += int((time.perf_counter() - t0) * 1e6)
+
+        # Per-token kernel: the HIP plugin's igpu_moe_decode_dev is one
+        # token at a time, so we still loop -- but we issue all bs kernels
+        # into the same HIP stream without sync between them, and stage
+        # the per-token input/output pointers via stride offsets.
         for t in range(n_tokens):
             base = t * _REQUEST_BYTES
             layer_id = payload[base]
-            hidden = payload[base + 1:base + 1 + _H * 4]
-            ids = payload[base + 1 + _H * 4:base + 1 + _H * 4 + _TOPK * 4]
-            wts = payload[base + 1 + _H * 4 + _TOPK * 4:base + _REQUEST_BYTES]
-
-            t0 = time.perf_counter()
-            rc = hip.hipMemcpy(h_dev, ctypes.c_void_p(ctypes.addressof(
-                (ctypes.c_uint8 * h_b).from_buffer_copy(hidden))),
-                ctypes.c_size_t(h_b), H2D)
-            if rc != 0:
-                _log("ERROR", "H2D hidden failed", rc=rc, token=t)
-                return 7
-            rc = hip.hipMemcpy(i_dev, ctypes.c_void_p(ctypes.addressof(
-                (ctypes.c_uint8 * i_b).from_buffer_copy(ids))),
-                ctypes.c_size_t(i_b), H2D)
-            if rc != 0:
-                _log("ERROR", "H2D ids failed", rc=rc)
-                return 7
-            rc = hip.hipMemcpy(w_dev, ctypes.c_void_p(ctypes.addressof(
-                (ctypes.c_uint8 * w_b).from_buffer_copy(wts))),
-                ctypes.c_size_t(w_b), H2D)
-            if rc != 0:
-                _log("ERROR", "H2D wts failed", rc=rc)
-                return 7
-            H2D_total_us += int((time.perf_counter() - t0) * 1e6)
-
-            # Run single layer
             t0 = time.perf_counter()
             rc = dll.igpu_moe_decode_dev(
                 ctypes.c_int(layer_id),
-                ctypes.c_void_p(h_dev),
-                ctypes.c_void_p(i_dev),
-                ctypes.c_void_p(w_dev),
-                ctypes.c_void_p(o_dev),
+                ctypes.c_void_p(h_dev + t * _H * 4),
+                ctypes.c_void_p(i_dev + t * _TOPK * 4),
+                ctypes.c_void_p(w_dev + t * _TOPK * 4),
+                ctypes.c_void_p(o_dev + t * _H * 4),
             )
             if rc != 0:
                 _log("ERROR", "moe decode failed", layer=layer_id, rc=rc)
                 return 8
             kernel_total_us += int((time.perf_counter() - t0) * 1e6)
 
-            # D2H output
-            t0 = time.perf_counter()
-            out_bytes = (ctypes.c_uint8 * _RESPONSE_BYTES).from_buffer(out_buf, t * _RESPONSE_BYTES)
-            rc = hip.hipMemcpy(
-                ctypes.c_void_p(ctypes.addressof(out_bytes)),
-                ctypes.c_void_p(o_dev),
-                ctypes.c_size_t(_RESPONSE_BYTES), D2H,
-            )
-            if rc != 0:
-                _log("ERROR", "D2H out failed", rc=rc)
-                return 9
-            D2H_total_us += int((time.perf_counter() - t0) * 1e6)
-
         # Sync once per request
         stream_handle = dll.igpu_get_stream()
         hip.hipStreamSynchronize(stream_handle)
+
+        # Batched D2H: pull all bs outputs in one hipMemcpy
+        t0 = time.perf_counter()
+        out_bytes = (ctypes.c_uint8 * (n_tokens * _RESPONSE_BYTES)).from_buffer(out_buf)
+        rc = hip.hipMemcpy(
+            ctypes.c_void_p(ctypes.addressof(out_bytes)),
+            ctypes.c_void_p(o_dev),
+            ctypes.c_size_t(n_tokens * _RESPONSE_BYTES), D2H,
+        )
+        if rc != 0:
+            _log("ERROR", "D2H out failed", rc=rc)
+            return 9
+        D2H_total_us += int((time.perf_counter() - t0) * 1e6)
 
         # Send response
         try:
