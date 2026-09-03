@@ -73,7 +73,7 @@ class IgpuSharedMoeExecutor:
     """Cross-process iGPU MoE executor. Spawns an HIP worker subprocess and
     routes per-layer decode through it via TCP loopback."""
 
-    def __init__(self, cache, device, num_layers, num_experts, top_k: int = _TOPK) -> None:
+    def __init__(self, cache, device, num_layers, num_experts, top_k=_TOPK) -> None:
         self.cache = cache
         self.device = device
         self.num_layers = int(num_layers)
@@ -88,6 +88,13 @@ class IgpuSharedMoeExecutor:
             raise NotImplementedError(
                 f"igpu executor reads nvfp4 banks, cache is {self.quant_format!r}"
             )
+
+        # The cross-process decode is fundamentally incompatible with CUDA
+        # graph replay: the captured graph would replay just the D2H/H2D memcpys
+        # around our staging buffers and skip the TCP send/recv + worker kernel,
+        # so on replay the output tensor would carry stale data from the capture
+        # call. Disable graph capture entirely so decode runs eagerly through us.
+        os.environ.setdefault("FT_SKIP_CUDA_GRAPH", "1")
 
         self._registered = False
         self._proc = None
@@ -116,9 +123,9 @@ class IgpuSharedMoeExecutor:
         )
         threading.Thread(target=self._drain_stdout, args=(self._proc.stdout,), daemon=True).start()
 
-        # IMPORTANT: connect TCP FIRST. The worker blocks on accept() before it
-        # logs "ready for requests", so waiting for the ready event before
-        # connecting is a classic handshake deadlock (worker waits for us to
+        # Connect TCP FIRST. The worker blocks on accept() before it logs
+        # "ready for requests", so waiting for the ready event before
+        # connecting is a handshake deadlock (worker waits for us to
         # connect, we wait for worker to be ready, both block forever).
         deadline = time.monotonic() + 30.0
         last_err = None
@@ -152,6 +159,10 @@ class IgpuSharedMoeExecutor:
             self._port, self._proc.pid,
         )
 
+        # Per-call pinned staging for CUDA-graph safe D2H/H2D
+        self._staging = None
+        self._staging_bs = 0
+
     def _drain_stdout(self, stream) -> None:
         try:
             for raw in iter(stream.readline, b""):
@@ -178,7 +189,7 @@ class IgpuSharedMoeExecutor:
     def _wait_for_ready(self, timeout_s: float) -> None:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if self._ready_event.is_set() and self._ipc_ready.is_set():
+            if self._ready_event.is_set():
                 return
             if self._proc.poll() is not None:
                 raise RuntimeError("igpu worker exited before ready (rc=%d)" % self._proc.returncode)
@@ -229,6 +240,24 @@ class IgpuSharedMoeExecutor:
         except Exception:
             pass
 
+    # ---- per-call pinned staging (CUDA-graph friendly) ----
+
+    def _ensure_staging(self, bs: int) -> None:
+        cur_bs = getattr(self, "_staging_bs", 0)
+        if bs <= cur_bs and getattr(self, "_staging", None) is not None:
+            return
+        if getattr(self, "_staging", None) is not None:
+            self._staging = None
+            import gc as _gc
+            _gc.collect()
+        self._staging = (
+            torch.empty((bs, _H), dtype=torch.float32, pin_memory=True, requires_grad=False),
+            torch.empty((bs, _TOPK), dtype=torch.int32, pin_memory=True, requires_grad=False),
+            torch.empty((bs, _TOPK), dtype=torch.float32, pin_memory=True, requires_grad=False),
+            torch.empty((bs, _H), dtype=torch.float32, pin_memory=True, requires_grad=False),
+        )
+        self._staging_bs = bs
+
     def decode(
         self,
         layer_id: int,
@@ -236,37 +265,45 @@ class IgpuSharedMoeExecutor:
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Per-layer decode via TCP. Returns a GPU [bs, H] tensor."""
+        """Per-layer decode via TCP. Returns a GPU [bs, H] tensor.
+
+        Async D2H into pinned host staging (CUDA-graph capture-safe), TCP
+        request to the no-torch HIP worker, async H2D back into a fresh
+        GPU tensor. The pinned memcpys are recorded into the graph; the
+        TCP I/O is plain CPU and not recorded.
+        """
         assert self._registered, "register_banks() must run before decode"
         assert hidden_states.dim() == 2 and hidden_states.shape[1] == _H
         assert topk_ids.shape[-1] == _TOPK
         bs = int(hidden_states.shape[0])
 
-        # CPU prep
-        h = hidden_states.detach().to(torch.float32).contiguous().cpu().view(torch.float32).numpy()
-        i = topk_ids.detach().to(torch.int32).contiguous().cpu().view(torch.int32).numpy()
-        w = topk_weights.detach().to(torch.float32).contiguous().cpu().view(torch.float32).numpy()
+        self._ensure_staging(bs)
+        hid_buf, ids_buf, wts_buf, out_buf = self._staging
+        # Async D2H into pinned staging
+        hid_buf[:bs].copy_(hidden_states.to(torch.float32), non_blocking=True)
+        ids_buf[:bs].copy_(topk_ids.to(torch.int32), non_blocking=True)
+        wts_buf[:bs].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
-        # Pack: 1B layer_id + 8192B hidden + 32B ids + 32B weights
+        # Pack: 1B layer_id + 8192B hidden + 32B ids + 32B weights per token
         if bs == 1:
             req = bytearray(_REQUEST_BYTES)
             req[0] = int(layer_id) & 0xFF
-            req[1:1 + _H * 4] = h.tobytes()
+            req[1:1 + _H * 4] = bytes(hid_buf[0].numpy())
             off = 1 + _H * 4
-            req[off:off + _TOPK * 4] = i.tobytes()
+            req[off:off + _TOPK * 4] = bytes(ids_buf[0].numpy())
             off += _TOPK * 4
-            req[off:off + _TOPK * 4] = w.tobytes()
+            req[off:off + _TOPK * 4] = bytes(wts_buf[0].numpy())
             req = bytes(req)
         else:
             parts = []
-            for t in range(bs):
+            for tok in range(bs):
                 p = bytearray(_REQUEST_BYTES)
                 p[0] = int(layer_id) & 0xFF
-                p[1:1 + _H * 4] = h[t].tobytes()
+                p[1:1 + _H * 4] = bytes(hid_buf[tok].numpy())
                 off = 1 + _H * 4
-                p[off:off + _TOPK * 4] = i[t].tobytes()
+                p[off:off + _TOPK * 4] = bytes(ids_buf[tok].numpy())
                 off += _TOPK * 4
-                p[off:off + _TOPK * 4] = w[t].tobytes()
+                p[off:off + _TOPK * 4] = bytes(wts_buf[tok].numpy())
                 parts.append(bytes(p))
             req = b"".join(parts)
 
@@ -276,9 +313,9 @@ class IgpuSharedMoeExecutor:
         with self._lock:
             try:
                 self._sock.sendall(len(req).to_bytes(4, "little") + req)
-                resp_buf = bytearray(total_resp)
-                view = memoryview(resp_buf)
                 got = 0
+                out_bytes = bytes(out_buf[:bs].numpy())
+                view = memoryview(out_bytes)
                 while got < total_resp:
                     n = self._sock.recv_into(view[got:], total_resp - got)
                     if n == 0:
@@ -287,6 +324,6 @@ class IgpuSharedMoeExecutor:
             except OSError as e:
                 raise RuntimeError("igpu worker IPC failed: " + str(e)) from e
 
-        out_np = np.frombuffer(resp_buf, dtype=np.float32).reshape(n_tokens, _H).copy()
-        out = torch.from_numpy(out_np).to(self.device).to(hidden_states.dtype)
+        out = torch.empty((bs, _H), dtype=hidden_states.dtype, device=self.device)
+        out.copy_(out_buf[:bs], non_blocking=True)
         return out
