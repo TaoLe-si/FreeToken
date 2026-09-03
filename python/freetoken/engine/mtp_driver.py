@@ -289,14 +289,12 @@ class MtpDriver:
     def accept_count(self, draft_ids: list[int], verify_ids: list[int], base: int) -> int:
         """How many drafts to accept. base is the index of the first draft in
         verify_ids (typically base=1 because verify_ids[0] should match prev_token_id).
+
+        C++ only -- no Python fallback by user request: one tight loop in C++ instead
+        of the per-iter Python list indexing + comparison.
         """
-        n = 0
-        for i, did in enumerate(draft_ids):
-            v = verify_ids[base + i] if (base + i) < len(verify_ids) else None
-            if v is None or v != did:
-                break
-            n += 1
-        return n
+        from freetoken.scheduler import _freetoken_sched as _sched_cpp
+        return _sched_cpp.accept_count(draft_ids, verify_ids, base)
 
     def commit_to_len(self, cache, req, new_cached_len: int) -> None:
         """Advance the request's KV cache to new_cached_len (hand-back the orphans)."""

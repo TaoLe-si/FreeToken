@@ -1201,7 +1201,9 @@ async function updateCtxHint(){
     var info = d.data && d.data[0] || {};
     var ctx = info.context_length || info.max_model_len || info.ctx_len;
     if(ctx){
-      hint.textContent = "模型上限 " + ctx;
+      hint.textContent = "（模型上下文 " + ctx + "）";
+      var mh = $("ctxModelHint");
+      if(mh) mh.textContent = ctx;
       var mt = $("pMaxTokens");
       mt.max = ctx;
       if(+mt.value > ctx) mt.value = ctx;
@@ -1222,7 +1224,7 @@ function chatParams(){
     temperature: _num("pTemp", 0.7),
     top_p:      _num("pTopP", 0.8),
     top_k:      _num("pTopK", 20),
-    max_tokens: _num("pMaxTokens", 1024),
+    max_tokens: _num("pMaxTokens", 4096),
   };
   if(stop.length) p.stop = stop;
   return p;

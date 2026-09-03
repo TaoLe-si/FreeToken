@@ -126,7 +126,7 @@ class Qwen3_5Model(BaseOP):
             # residual buffer in place).
             raw = (x + residual) if residual is not None else x
             x, _ = self.norm.forward_add_residual(x, residual)
-            return x, raw
+            return x, x
         x, _ = self.norm.forward_add_residual(x, residual)
         return x
 
@@ -182,11 +182,11 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         output, raw = self.model.forward(batch.input_ids, return_raw=True)
         if batch.size == 0:
             zeros = output.new_zeros((0, output.shape[-1]))
-            return self.lm_head.forward(output), zeros, raw.detach()
+            return self.lm_head.forward(output), zeros, output.detach()
         indices = batch.attn_metadata.get_last_indices(batch.size)
         # MTP consumes the PRE-final-norm raw hidden -- the head has its own
         # pre_fc_norm_hidden and was trained against this distribution.
-        prev_hidden = raw[indices].detach()  # [bs, H]
+        prev_hidden = output[indices].detach()  # [bs, H]
         # If the inner forward already ran the captured graph (set the flag during
         # replay), the lm_head was captured too -- pull logits from buffer.logits
         # instead of re-running lm_head (which would re-trigger a fresh graph).
@@ -197,7 +197,7 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             _logits_buf = getattr(batch, "mtp_logits_buf", None)
             if _logits_buf is not None:
                 logits = _logits_buf[: batch.size].detach()
-                return logits, prev_hidden, raw.detach()
+                return logits, prev_hidden, output.detach()
         logits = self.lm_head.forward(output)
         # Diagnostic (FT_MTP_DIAG=1): compare what the MTP head actually sees vs the
         # last-layer outputs the model produces. We log BOTH the pre-final-norm raw
@@ -230,6 +230,6 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                     f"norm={rw.norm(dim=-1).mean().item():.3f}",
                     flush=True,
                 )
-        return logits, prev_hidden, raw.detach()
+        return logits, prev_hidden, output.detach()
 
 __all__ = ["Qwen3_5MoEForCausalLM"]

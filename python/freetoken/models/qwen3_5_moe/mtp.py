@@ -373,7 +373,7 @@ class Qwen3_5MtpHead(nn.Module):
         # rows diverge from what the MTP forward would compute at the same
         # position, so the head's attention queries against a different K/V
         # distribution than what it was trained with.
-        h = fc_out + hiddens
+        h = fc_out
         h = _rmsnorm(h, self.input_layernorm)
         positions = torch.arange(
             start_pos + 1, start_pos + 1 + tokens.numel(),
@@ -397,7 +397,7 @@ class Qwen3_5MtpHead(nn.Module):
             torch.cuda.synchronize()
             self._perf["fc"] += (_time.perf_counter() - t_fc0) * 1e6
             self._perf["fc_n"] += 1
-        h = fc_out + prev_hidden
+        h = fc_out
         if os.environ.get("FT_MTP_DEBUG"):
             print(f"[MTP-dbg] fcprobe: fc_out_norm={float(fc_out.float().norm()):.3f} "
                   f"in_hid_norm={float(prev_hidden.float().norm()):.3f} "

@@ -61,6 +61,20 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
+
+
+# Module-level export: the scheduler hot path is C++-only (P0 of the rewrite).
+# If the .pyd is missing, surface a clear build error pointing at the rebuild step.
+try:
+    from freetoken.scheduler import _freetoken_sched as _sched_cpp
+    _SCHED_CPP_OK = True
+except ImportError as _sched_import_err:
+    raise RuntimeError(
+        "freetoken.scheduler._freetoken_sched.pyd missing -- the scheduler hot path is C++-only.\n"
+        "Rebuild with E:\\FreeToken\\_build_sched.bat\n"
+        "Underlying error: " + repr(_sched_import_err)
+    ) from _sched_import_err
+
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
@@ -422,6 +436,11 @@ class Scheduler(SchedulerIOMixin):
 
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
+        # C++ only -- no Python fallback by user request:
+        # materialise the whole next_tokens_cpu as a Python list in ONE C++ call instead
+        # of repeated `.item()` syncs per req (the previous code did `int(t.item())` inside
+        # the for-loop, which is `bs` separate GPU syncs).
+        next_tokens_list = _sched_cpp.gpu_int_to_cpu_list(next_tokens_cpu)
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
@@ -449,9 +468,11 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
+                # C++ only -- no Python fallback by user request: pull the single token
+                # from the pre-materialised Python list (no per-req .item() GPU sync).
+                next_token_int = next_tokens_list[i]
+                req.append_host(next_tokens_cpu[i].unsqueeze(0))
+                next_token = next_token_int
                 if os.environ.get("FT_MTP_DEBUG"):
                     _pool = getattr(self.engine, "linear_state_pool", None)
                     if _pool is not None:
@@ -849,7 +870,10 @@ class Scheduler(SchedulerIOMixin):
         overlap = bool(getattr(batch, "mtp_overlap", False))
         pred0 = getattr(req, "mtp_pred0", None) if overlap else None
         K = len(drafts)
-        rows = forward_output.next_tokens_cpu.to(torch.int32).tolist()
+                # C++ only -- no Python fallback by user request:
+        # one C++ call converts the int64 GPU host tensor to int32 std::vector<int64_t>
+        # instead of `.to(torch.int32).tolist()` (two PyTorch dispatch ops).
+        rows = _sched_cpp.gpu_int_to_cpu_list(forward_output.next_tokens_cpu)
         # ----------------------------------------------------------------------
         # PATH 3 (EAGLE-style): re-run the MTP head K times using the VERIFY forward's
         # main-model hidden states as prev_hidden (teacher forcing). Hook-time drafts
@@ -1567,13 +1591,22 @@ class Scheduler(SchedulerIOMixin):
     def _restore_linear_states(self, batch) -> None:
         """COW-restore a hybrid prefix hit's GDN snapshot into its freshly-allocated live slot
         (first chunk only). MUST run on the ENGINE stream so it is program-ordered after the
-        prior batch's snapshot writes and before this forward reads the live slot."""
+        prior batch's snapshot writes and before this forward reads the live slot.
+
+        C++ only -- no Python fallback by user request: the per-req for-loop that called
+        `pool.copy_from(src, dst)` is now one C++ call over the full src/dst slot lists.
+        """
         pool = self.engine.linear_state_pool
         if pool is None or not batch.is_prefill:
             return
+        src_list = [r.mamba_restore_src for r in batch.reqs if r.mamba_restore_src is not None]
+        dst_list = [r.linear_slot_idx for r in batch.reqs if r.mamba_restore_src is not None]
+        if not src_list:
+            return
+        _sched_cpp.restore_linear_states(
+            pool.conv_states, pool.recurrent_states, src_list, dst_list)
         for req in batch.reqs:
             if req.mamba_restore_src is not None:
-                pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
 
     def _free_req_resources(self, req: Req) -> None:
@@ -1783,11 +1816,12 @@ class Scheduler(SchedulerIOMixin):
                 # the old keying = input_mapping's table_idx column (already staged, no H2D).
                 if self.cache_manager.is_hybrid:
                     pool = self.engine.linear_state_pool
-                    slots = [r.linear_slot_idx if r.linear_slot_idx is not None
-                             else pool.padding_slot for r in batch.padded_reqs]
-                    batch.linear_table_idx = torch.tensor(
-                        slots, dtype=torch.int32, device="cpu", pin_memory=True
-                    ).to(self.device, non_blocking=True)
+                    # C++ only -- no Python fallback by user request:
+                    # one C++ call replaces the list comprehension + pinned alloc + H2D.
+                    slot_inputs = [int(r.linear_slot_idx) if r.linear_slot_idx is not None else -1
+                                   for r in batch.padded_reqs]
+                    batch.linear_table_idx = _sched_cpp.build_linear_table_idx_decode_hybrid(
+                        slot_inputs, int(pool.padding_slot), self.device)
                 else:
                     batch.linear_table_idx = input_mapping[0].to(torch.int32)
             # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
@@ -1805,10 +1839,10 @@ class Scheduler(SchedulerIOMixin):
                 K = batch.mtp_verify_k
                 device = self.device
                 # Existing C.5 promotion: per-step snap slots as int64 device tensor.
+                # C++ only -- no Python fallback by user request: the 4 torch.tensor()
+                # allocations (snap_slots/cu_seqlens/has_init/host_snap_slots) are bundled
+                # into one C++ call below.
                 batch.fla_metadata.mtp_verify_step_idx = 0
-                batch.fla_metadata.mtp_verify_snap_slots = torch.tensor(
-                    slot_list, dtype=torch.int64, device=device
-                )
                 # G.2: persistent buffers + stable host ints so the C.4 per-step decode path
                 # (gdn.py _forward_mtp_verify) does NOT allocate new tensors or call .item()
                 # during forward -- required for CUDA-graph capture. All values are stable
@@ -1823,16 +1857,17 @@ class Scheduler(SchedulerIOMixin):
                 # a K-row tensor: OOB q/k/v read, OOB output write, and a corrupted
                 # over-advanced final state written back to the LIVE GDN slot.
                 _verify_rows = K if getattr(batch, "mtp_overlap", False) else K + 1
-                batch.fla_metadata.mtp_verify_cu_seqlens_varlen = torch.tensor(
-                    [0, _verify_rows], dtype=torch.int32, device=device
-                )
-                batch.fla_metadata.mtp_verify_has_initial_state = torch.tensor(
-                    [True], dtype=torch.bool, device=device
-                )
+                snap_slots_dev, cu_varlen_dev, has_init_dev, host_snap_pinned = _sched_cpp.build_mtp_verify_meta(
+                    [int(s) for s in slot_list], int(_verify_rows), device)
+                batch.fla_metadata.mtp_verify_snap_slots = snap_slots_dev
+                batch.fla_metadata.mtp_verify_cu_seqlens_varlen = cu_varlen_dev
+                batch.fla_metadata.mtp_verify_has_initial_state = has_init_dev
                 # snap_slots is a Python list[int]; copy it (cheap) for stable ownership
                 # so a downstream mutation of req._mtp_verify_snap_slots_for_hook can't
-                # bleed into the captured graph.
-                batch.fla_metadata.mtp_verify_snap_host_slots = list(slot_list)
+                # bleed into the captured graph. The C++ wrapper above already returns a
+                # pinned-host int32 clone that we re-materialise as a Python list --
+                # int() reads are cheap so this stays out of the hot loop.
+                batch.fla_metadata.mtp_verify_snap_host_slots = host_snap_pinned.tolist()
                 # live slot = req's linear slot (hybrid-radix) or table_idx (naive). Stable
                 # for req lifetime -- see _mtp_verify_snap_slots_for_hook ownership above.
                 verify_req = batch.reqs[0] if batch.reqs else None
@@ -1924,39 +1959,48 @@ class Scheduler(SchedulerIOMixin):
         # also keeps the verify batch from clobbering the live decode table_idx it shares with the
         # request's normal decode row.
         if not getattr(batch, "mtp_verify", False):
-            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+            # C++ only -- no Python fallback by user request.
+            # Historical context: this is the line that crashed the API call
+            # before P0 of the C++ rewrite (broadcast error from
+            # output_mapping=None when the Python return was truncated). The
+            # C++ variant uses index_put_ with explicit shape checks, so a
+            # bad output_mapping now raises a clean RuntimeError instead of
+            # silently corrupting the token pool.
+            _sched_cpp.write_tokens(
+                self.token_pool,
+                output_mapping[0],  # table_idx_dev
+                output_mapping[1],  # device_len_dev
+                forward_output.next_tokens_gpu,
+            )
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
-    needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
-    offset = 0
-    for req in batch.padded_reqs:
-        length = req.extend_len
-        torch.arange(
-            req.cached_len,
-            req.device_len,
-            dtype=torch.int32,
-            out=indices_host[offset : offset + length],
-        )
-        offset += length
-    return indices_host.to(device, non_blocking=True)
+    # C++ only -- no Python fallback by user request.
+    # Python originally had `torch.arange(cached, device_len, out=host_slice])`
+    # per req in a for-loop; C++ version packs everything in one tight loop over
+    # a single pinned-host tensor then H2D-copies once.
+    positions_host, _ = _sched_cpp.make_positions(
+        [int(r.extend_len) for r in batch.padded_reqs],
+        [int(r.cached_len) for r in batch.padded_reqs],
+    )
+    return positions_host.to(device, non_blocking=True)
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
-    offset = 0
-    for req in batch.padded_reqs:
-        length = req.extend_len
-        mapping_host[offset : offset + length].fill_(req.table_idx)
-        offset += length
-    return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
-
+    # C++ only -- no Python fallback by user request.
+    return _sched_cpp.make_input(
+        [int(r.table_idx) for r in batch.padded_reqs],
+        [int(r.extend_len) for r in batch.padded_reqs],
+        [int(r.cached_len) for r in batch.padded_reqs],
+        device,
+    )
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_list = [req.table_idx for req in batch.reqs]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-    write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+    # C++ only -- no Python fallback by user request.
+    return _sched_cpp.make_write(
+        [int(req.table_idx) for req in batch.reqs],
+        [(int(req.device_len) if req.can_decode else -1) for req in batch.reqs],
+        device,
+    )
