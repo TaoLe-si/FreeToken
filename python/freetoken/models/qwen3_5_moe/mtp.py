@@ -368,11 +368,12 @@ class Qwen3_5MtpHead(nn.Module):
             ).to(self.dtype)
         else:
             fc_out = cat[:, : self.cfg.hidden_size]
-        # Official Qwen3.6 MTP chain (vLLM qwen3_next_mtp.py + ORT bit-exact
-        # export): fc_out feeds the decoder layer DIRECTLY -- no embedding or
-        # prev_hidden residual is added before input_layernorm (the layer's own
-        # residual chain starts at fc_out).
-        h = fc_out
+        # Must match forward_with_state: residual + main-model hidden before the
+        # post-Norm layer that feeds the head's QKV. Without this the head-KV
+        # rows diverge from what the MTP forward would compute at the same
+        # position, so the head's attention queries against a different K/V
+        # distribution than what it was trained with.
+        h = fc_out + hiddens
         h = _rmsnorm(h, self.input_layernorm)
         positions = torch.arange(
             start_pos + 1, start_pos + 1 + tokens.numel(),
@@ -396,7 +397,7 @@ class Qwen3_5MtpHead(nn.Module):
             torch.cuda.synchronize()
             self._perf["fc"] += (_time.perf_counter() - t_fc0) * 1e6
             self._perf["fc_n"] += 1
-        h = fc_out
+        h = fc_out + prev_hidden
         if os.environ.get("FT_MTP_DEBUG"):
             print(f"[MTP-dbg] fcprobe: fc_out_norm={float(fc_out.float().norm()):.3f} "
                   f"in_hid_norm={float(prev_hidden.float().norm()):.3f} "
