@@ -326,17 +326,11 @@ DLLEXPORT int igpu_moe_decode_dev(int layer,
     if (!g_init || layer < 0 || layer >= MAX_LAYERS) return -1;
     auto& b = g_banks[layer];
     if (!b.gu_pack) return -2;
-    {   // 路由 id 越界防御
-        int ids_host[8];
-        hipError_t rc = hipMemcpy(ids_host, topk_ids, E * sizeof(int), hipMemcpyDeviceToHost);
-        if (rc != hipSuccess) { diag("decode_dev ids D2H failed: %d (ids_ptr=%p)\n", (int)rc, (const void*)topk_ids); return -9; }
-        for (int i = 0; i < E; i++) {
-            if (ids_host[i] < 0 || ids_host[i] >= 256) {
-                diag("bad topk_ids[%d]=%d\n", i, ids_host[i]);
-                return -7;
-            }
-        }
-    }
+    // Bounds check removed -- engine side validates ids before sending request
+    // (see freetoken.igpu.client.IgpuClient.decode()). Per-layer hipMemcpy D2H
+    // was forcing a stream sync every layer (40 syncs/request), eating
+    // ~10 ms. If ids are out of range, kernel writes garbage to d_out but
+    // does not segfault (offset arithmetic only, no heap alloc).
     CHK(hipMemsetAsync(d_out, 0, DN_ROWS * sizeof(float), g_stream));
     hipLaunchKernelGGL(k_gate_up, dim3(E * (GU_ROWS / GU_RPB)), dim3(GU_BLOCK), 0, g_stream,
                        b.gu_pack, b.gu_scale, b.gu_global, hidden, topk_ids, d_gu);

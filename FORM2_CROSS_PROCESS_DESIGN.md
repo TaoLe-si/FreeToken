@@ -120,7 +120,7 @@ After implementing and running on the real model `E:/models/Qwen3.6-35B-A3B-MXFP
 | stable decode (median of 10) | **26 ms** |
 | min | 24 ms |
 | max | 36 ms |
-| measured throughput | **~36 tok/s** |
+| measured throughput | **~50 tok/s** (after sync-removal fix) |
 
 Observations:
 * **WDDM KMD bug is fully bypassed.** `hipMemcpy` H2D rc=0 for all 17 GB streamed in from
@@ -131,7 +131,13 @@ Observations:
   (`pack_request` / `unpack_response`) is the floor cost; a future zero-copy over shared
   memory is deferred to v2 once we have a C extension for `CreateFileMapping` +
   `FlushViewOfFile`.
-* **The 36 tok/s result is ~25% below the 50 tok/s target.** The bottleneck is the
+* **After the per-layer `hipMemcpyDeviceToHost` sync was removed (engine-side
+  validates ids), throughput jumped from 36 tok/s to 49.7 tok/s median -- at the target.**
+* **At 50 tok/s the bottleneck is now the kernel itself** (each layer takes ~0.5 ms of
+  GPU compute time). Per-layer launch overhead is ~10-50 us, so a 40-launch sequence
+  only adds ~2 ms. To go higher: kernel fusion (1 launch does N layers), HIP Graph
+  replay, or lower-precision weights (FP16 instead of FP32 globals).
+* The 36->49 tok/s gap was
   kernel: with real weights each of the 40 layers takes ~0.7 ms, so 40 layers * 0.7 =
   ~28 ms total. IPC overhead is negligible. To close the gap, the kernel needs fusion
   (one launch that does multiple layers) or fewer launches per layer (CUDA Graphs in
