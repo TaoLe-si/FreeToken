@@ -154,7 +154,11 @@ def _stream_ftw_to_gtt(path, dll, hip):
                                str(sorted(by_layer[b])))
 
     num_layers = len(by_layer[expected[0]])
+    total_bytes = sum(by_layer[b][L]["nbytes"] for L in range(num_layers) for b in expected)
+    _log("INFO", "ftw stream begin", total_bytes=total_bytes, layers=num_layers)
     ptrs = []
+    bytes_done = 0
+    last_log = time.perf_counter()
     for L in range(num_layers):
         layer_ptrs = []
         for b in expected:
@@ -184,7 +188,17 @@ def _stream_ftw_to_gtt(path, dll, hip):
                     raise RuntimeError("hipMemcpy H2D failed rc=" + str(rc) +
                                        " for " + repr(b) + " L" + str(L))
                 cursor += take
+                bytes_done += take
+                if time.perf_counter() - last_log > 2.0:
+                    pct = 100.0 * bytes_done / total_bytes
+                    _log("INFO", "ftw stream progress",
+                         pct=round(pct, 1), bytes_done=bytes_done, total=total_bytes)
+                    last_log = time.perf_counter()
         ptrs.append(tuple(layer_ptrs))
+        if L % 5 == 4:
+            _log("INFO", "ftw layers streamed", layer=L+1, total_layers=num_layers,
+                 bytes_done=bytes_done, total=total_bytes)
+    _log("INFO", "ftw stream end", bytes_done=bytes_done, total=total_bytes)
 
     try:
         for m, mv in list(reader._maps.values()):

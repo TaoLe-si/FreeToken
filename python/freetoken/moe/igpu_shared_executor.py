@@ -115,9 +115,11 @@ class IgpuSharedMoeExecutor:
             creationflags=CREATE_NO_WINDOW,
         )
         threading.Thread(target=self._drain_stdout, args=(self._proc.stdout,), daemon=True).start()
-        self._wait_for_ready(timeout_s=180.0)
 
-        # Connect TCP socket to worker
+        # IMPORTANT: connect TCP FIRST. The worker blocks on accept() before it
+        # logs "ready for requests", so waiting for the ready event before
+        # connecting is a classic handshake deadlock (worker waits for us to
+        # connect, we wait for worker to be ready, both block forever).
         deadline = time.monotonic() + 30.0
         last_err = None
         while time.monotonic() < deadline:
@@ -135,9 +137,16 @@ class IgpuSharedMoeExecutor:
                     pass
                 time.sleep(0.2)
         if self._sock is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
             raise RuntimeError(
                 f"failed to connect to igpu worker at port {self._port}: {last_err}"
             )
+
+        # Now wait for the worker to actually load HIP + stream FTW + be ready
+        self._wait_for_ready(timeout_s=240.0)
         logger.info_rank0(
             "iGPU executor connected to worker on 127.0.0.1:%d (pid=%d)",
             self._port, self._proc.pid,
@@ -145,17 +154,20 @@ class IgpuSharedMoeExecutor:
 
     def _drain_stdout(self, stream) -> None:
         try:
-            for line in iter(stream.readline, b""):
-                if not line:
+            for raw in iter(stream.readline, b""):
+                if not raw:
                     break
                 try:
-                    text = line.decode("utf-8", errors="replace").rstrip()
+                    text = raw.decode("utf-8", errors="replace").rstrip()
                 except Exception:
                     continue
                 if text.startswith("IGPU_W "):
-                    sys.stderr.write("[igpu-worker] " + text[len("IGPU_W "):] + "\n")
+                    msg = text[len("IGPU_W "):]
+                    sys.stderr.write("[igpu-worker] " + msg + "\n")
+                    sys.stderr.flush()
                 elif text:
                     sys.stderr.write("[igpu-worker] " + text + "\n")
+                    sys.stderr.flush()
                 if '"msg": "ready for requests"' in text:
                     self._ready_event.set()
                 if '"msg": "ipc connected"' in text:
